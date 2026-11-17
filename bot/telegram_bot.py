@@ -21,6 +21,7 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.db import Database
+from bot.keyboards import main_menu_keyboard, set_actions_keyboard
 from bot.models import (
     format_retirement_status_and_countdown,
     format_source_label,
@@ -63,41 +64,6 @@ def parse_optional_bound(raw: str, is_min: bool) -> Optional[float]:
     return round(val, 2)
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Add LEGO Set", callback_data="menu:add"),
-                InlineKeyboardButton(text="📋 My Subscribed Sets", callback_data="menu:list"),
-            ],
-            [
-                InlineKeyboardButton(text="🔄 Check Prices Now", callback_data="menu:check_all"),
-                InlineKeyboardButton(text="⏳ Retirement Dates", callback_data="menu:retire"),
-            ],
-            [
-                InlineKeyboardButton(text="📡 Scraper & FX Status", callback_data="menu:status"),
-                InlineKeyboardButton(text="📜 Run Logs (DB)", callback_data="menu:logs"),
-            ],
-        ]
-    )
-
-
-def set_actions_keyboard(set_number: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=f"🔍 Check {set_number}", callback_data=f"set:check:{set_number}"),
-                InlineKeyboardButton(text=f"📈 Chart {set_number}", callback_data=f"set:chart:{set_number}"),
-                InlineKeyboardButton(text=f"🛒 Top Deals", callback_data=f"set:deals:{set_number}"),
-            ],
-            [
-                InlineKeyboardButton(text="✏️ Edit Price Range", callback_data=f"set:edit:{set_number}"),
-                InlineKeyboardButton(text=f"🗑 Remove {set_number}", callback_data=f"set:remove:{set_number}"),
-            ],
-        ]
-    )
-
-
 def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     dp = Dispatcher(storage=MemoryStorage())
     router = Router()
@@ -137,6 +103,13 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             "• <code>/remove 21348</code> — Unsubscribe from a set"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+    @router.callback_query(F.data == "menu:main")
+    async def cb_menu_main(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await safe_callback_answer(callback)
+        await cmd_start(callback.message, state)
 
     # -------------------------------------------------------------------------
     # /add Command & Interactive Wizard (Price From / Price To with Skip)
@@ -400,9 +373,17 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return
         removed = await db.remove_subscription(message.chat.id, set_number)
         if removed:
-            await message.answer(f"🗑 Removed <b>LEGO {html.escape(set_number)}</b> from your subscriptions.", parse_mode="HTML")
+            await message.answer(
+                f"🗑 Removed <b>LEGO {html.escape(set_number)}</b> from your subscriptions.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
         else:
-            await message.answer(f"⚠️ Set <b>{html.escape(set_number)}</b> was not in your subscriptions.", parse_mode="HTML")
+            await message.answer(
+                f"⚠️ Set <b>{html.escape(set_number)}</b> was not in your subscriptions.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
 
     @router.callback_query(F.data.startswith("set:remove:"))
     async def cb_remove_set(callback: CallbackQuery) -> None:
@@ -414,6 +395,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await callback.message.edit_text(
             f"🗑 Unsubscribed from <b>LEGO {html.escape(set_number)}</b>.",
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
 
     # -------------------------------------------------------------------------
@@ -465,7 +447,12 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             f"⏳ <b>Retirement Status:</b> {html.escape(ret_str)}\n"
             f"🎯 <b>Your Range:</b> {html.escape(sub.formatted_range)}"
         )
-        await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
+        await msg.answer_photo(
+            photo=photo,
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=set_actions_keyboard(set_number),
+        )
 
     # -------------------------------------------------------------------------
     # /deals Command & Callback
@@ -497,7 +484,11 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             await wait_m.delete()
 
         if not rows:
-            await msg.answer(f"No offers found yet for <b>LEGO {html.escape(set_number)}</b>.", parse_mode="HTML")
+            await msg.answer(
+                f"No offers found yet for <b>LEGO {html.escape(set_number)}</b>.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
             return
 
         stats = await db.get_price_stats(set_number)
@@ -529,7 +520,12 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
                 f"<a href=\"{safe_href}\"><b>{p_str} ↗</b></a> [<i>{html.escape(str(r['condition']))}</i>]"
             )
 
-        await msg.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+        await msg.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=set_actions_keyboard(set_number),
+        )
 
     # -------------------------------------------------------------------------
     # /check Command & Callbacks
@@ -557,6 +553,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             await wait.edit_text(
                 f"✅ Full scan complete! Checked <b>{len(res)}</b> sets, recorded <b>{total_found}</b> valid offers.",
                 parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
             )
 
     @router.callback_query(F.data == "menu:check_all")
@@ -570,6 +567,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await wait.edit_text(
             f"✅ Full scan complete! Checked <b>{len(res)}</b> sets, recorded <b>{total_found}</b> valid offers.",
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
 
     @router.callback_query(F.data.startswith("set:check:"))
@@ -599,11 +597,16 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         wait = await message.answer("⏳ Checking retirement dates on Brickset, BrickEconomy & Promoklocki...", parse_mode="HTML")
         summaries = await monitor.check_all_retirement_dates(force_report_chat_id=message.chat.id)
         if not summaries:
-            await wait.edit_text("📭 No subscribed sets to check. Use /add first!", parse_mode="HTML")
+            await wait.edit_text(
+                "📭 No subscribed sets to check. Use /add first!",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
             return
         await wait.edit_text(
             "⏳ <b>Subscribed LEGO Sets Retirement Status:</b>\n\n" + "\n".join(summaries),
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
 
     @router.callback_query(F.data == "menu:retire")
@@ -614,11 +617,16 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         wait = await callback.message.answer("⏳ Checking retirement dates on Brickset, BrickEconomy & Promoklocki...", parse_mode="HTML")
         summaries = await monitor.check_all_retirement_dates(force_report_chat_id=callback.message.chat.id)
         if not summaries:
-            await wait.edit_text("📭 No subscribed sets to check.", parse_mode="HTML")
+            await wait.edit_text(
+                "📭 No subscribed sets to check.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
             return
         await wait.edit_text(
             "⏳ <b>Subscribed LEGO Sets Retirement Status:</b>\n\n" + "\n".join(summaries),
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
 
     # -------------------------------------------------------------------------
@@ -674,7 +682,12 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             output_lines.append(line)
             total_len += len(line) + 1
 
-        await msg.answer("\n".join(output_lines), parse_mode="HTML", disable_web_page_preview=True)
+        await msg.answer(
+            "\n".join(output_lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=main_menu_keyboard(),
+        )
 
     # -------------------------------------------------------------------------
     # /status Command & Callback
@@ -719,6 +732,6 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
                     f"<b>{r['offers_count']} offers</b> ({r['last_run_at']})"
                 )
 
-        await msg.answer("\n".join(lines), parse_mode="HTML")
+        await msg.answer("\n".join(lines), parse_mode="HTML", reply_markup=main_menu_keyboard())
 
     return dp

@@ -12,6 +12,7 @@ from aiogram import Bot
 from aiogram.types import BufferedInputFile
 
 from bot.db import Database
+from bot.keyboards import main_menu_keyboard
 from bot.models import (
     Offer,
     PriceStats,
@@ -438,6 +439,7 @@ class LegoMonitorService:
                         photo=photo_file,
                         caption=caption,
                         parse_mode="HTML",
+                        reply_markup=main_menu_keyboard(),
                     )
                 else:
                     await self.bot.send_message(
@@ -445,6 +447,7 @@ class LegoMonitorService:
                         text=caption,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
+                        reply_markup=main_menu_keyboard(),
                     )
                 # If there are multiple new offers (up to 20), send all of them in a single message
                 if len(top_batch) > 1:
@@ -454,6 +457,7 @@ class LegoMonitorService:
                         text=batch_text,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
+                        reply_markup=main_menu_keyboard(),
                     )
             # Mark ALL unnotified matching offers from this scan as notified so they are
             # never dripped out in small batches of 2-4 on subsequent 5-minute runs!
@@ -550,7 +554,8 @@ class LegoMonitorService:
         lines = [
             f"<b>LEGO {html.escape(sub.set_number)} - {set_title}</b>",
             f"Official LEGO Catalog Price: <b>{msrp_str}</b>",
-            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({html.escape(details_str)}) {store_link}",
+            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({html.escape(details_str)})",
+            store_link,
             "",
             f"Your Price Range: <b>{html.escape(sub.formatted_range)}</b>",
             f"Retirement Status: {html.escape(ret_line)}",
@@ -636,7 +641,10 @@ class LegoMonitorService:
             return
         try:
             await self.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode="HTML"
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
             )
         except Exception as exc:
             logger.error(
