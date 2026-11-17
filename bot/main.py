@@ -224,30 +224,35 @@ async def run_daemon(
             logger.info("Scheduled retirement scan cancelled cleanly during shutdown.")
 
     scheduler = AsyncIOScheduler()
-    # 1. Every 5 minutes: check prices across all 13 Polish & EU sites
-    scheduler.add_job(
-        _scheduled_price_scan,
-        trigger="interval",
-        minutes=settings.price_check_interval_minutes,
-        id="price_scan_job",
-        max_instances=1,
-        coalesce=True,
-    )
-    # 2. Every ~5 days: check retirement dates & milestone countdowns
-    scheduler.add_job(
-        _scheduled_retirement_scan,
-        trigger="interval",
-        days=settings.retirement_check_interval_days,
-        id="retirement_scan_job",
-        max_instances=1,
-        coalesce=True,
-    )
-    scheduler.start()
-    logger.info(
-        "Scheduler started: price check every %d min, retirement check every %d days.",
-        settings.price_check_interval_minutes,
-        settings.retirement_check_interval_days,
-    )
+    if not duration_minutes:
+        # Permanent local 24/7 mode: repeat price check every 5 minutes & retirement check every ~5 days
+        scheduler.add_job(
+            _scheduled_price_scan,
+            trigger="interval",
+            minutes=settings.price_check_interval_minutes,
+            id="price_scan_job",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.add_job(
+            _scheduled_retirement_scan,
+            trigger="interval",
+            days=settings.retirement_check_interval_days,
+            id="retirement_scan_job",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        logger.info(
+            "Scheduler started: price check every %d min, retirement check every %d days.",
+            settings.price_check_interval_minutes,
+            settings.retirement_check_interval_days,
+        )
+    else:
+        logger.info(
+            "GitHub Actions 24/7 polling mode (%d min): scanning all sites once at startup.",
+            duration_minutes,
+        )
 
     # Trigger an initial background scan shortly after startup
     async def _initial_tasks() -> None:
