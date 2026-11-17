@@ -1,0 +1,85 @@
+name: LEGO Poland & EU Price Tracker
+
+on:
+  schedule:
+    # Run every 5 minutes for new low price checks
+    - cron: "*/5 * * * *"
+    # Run once every 5 days at 09:00 UTC for retirement date & milestone checks
+    - cron: "0 9 */5 * *"
+  workflow_dispatch:
+    inputs:
+      check_retirement:
+        description: "Also check retirement dates on Brickset/BrickEconomy/Promoklocki"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: lego-tracker-state
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  track-lego-deals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore SQLite database from orphan state branch (if exists)
+        run: |
+          mkdir -p data
+          git fetch origin db-state:db-state 2>/dev/null || true
+          git checkout db-state -- data/lego_tracker.db 2>/dev/null || true
+
+      - name: Run LEGO Price & Telegram Command Scanner
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DEFAULT_SUBSCRIPTIONS: ${{ secrets.DEFAULT_SUBSCRIPTIONS }}
+          PROXY_URLS: ${{ secrets.PROXY_URLS }}
+          CF_WORKER_PROXY_URL: ${{ secrets.CF_WORKER_PROXY_URL }}
+          CF_WORKER_SECRET: ${{ secrets.CF_WORKER_SECRET }}
+          ALLEGRO_CLIENT_ID: ${{ secrets.ALLEGRO_CLIENT_ID }}
+          ALLEGRO_CLIENT_SECRET: ${{ secrets.ALLEGRO_CLIENT_SECRET }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
+          BRICKSET_API_KEY: ${{ secrets.BRICKSET_API_KEY }}
+        run: |
+          if [ "${{ github.event.schedule }}" = "0 9 */5 * *" ] || [ "${{ inputs.check_retirement }}" = "true" ]; then
+            python -m bot.main --once --check-retirement
+          else
+            python -m bot.main --once
+          fi
+
+      - name: Persist SQLite database to dedicated `db-state` branch (keeps `main` history clean)
+        if: always()
+        run: |
+          if [ -f data/lego_tracker.db ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout --orphan temp-db-state
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            git add -f data/lego_tracker.db
+            git commit -m "Update LEGO tracker SQLite state" || true
+            git branch -M temp-db-state db-state
+            git push -f origin db-state
+          fi

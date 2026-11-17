@@ -1,0 +1,20 @@
+# Fly.io configuration for 24/7 deployment with persistent SQLite volume
+app = "lego-poland-price-bot"
+primary_region = "waw" # Warsaw, Poland region for Polish IP geolocation & low latency!
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  DATABASE_PATH = "/app/data/lego_tracker.db"
+  PRICE_CHECK_INTERVAL_MINUTES = "5"
+  RETIREMENT_CHECK_INTERVAL_DAYS = "5"
+
+[[mounts]]
+  source = "lego_data"
+  destination = "/app/data"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

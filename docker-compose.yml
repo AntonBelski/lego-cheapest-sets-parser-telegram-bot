@@ -1,0 +1,9 @@
+services:
+  lego-bot:
+    build: .
+    container_name: lego-cheapest-sets-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

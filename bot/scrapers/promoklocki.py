@@ -1,0 +1,186 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from datetime import date
+from typing import Optional
+from bs4 import BeautifulSoup
+
+from bot.models import Offer, SetMetadata
+from bot.scrapers.base import BaseScraper, parse_price_number
+from bot.services.filter import is_authentic_and_complete_set
+from bot.services.http_client import http_client
+
+logger = logging.getLogger(__name__)
+
+
+class PromoklockiScraper(BaseScraper):
+    """
+    Parser for promoklocki.pl/{set_number}:
+    - Extracts official LEGO.pl MSRP catalog price ('Cena katalogowa')
+    - Extracts set name, official image, and production/retirement years
+    - Extracts current active store offers on the set page
+    - Extracts embedded historical lowest price points for chart seeding
+    """
+
+    source_name = "promoklocki.pl"
+
+    async def fetch_page(self, set_number: str) -> tuple[int, str]:
+        url = f"https://promoklocki.pl/{set_number}"
+        status, html, _ = await http_client.get_text(url)
+        return status, html
+
+    async def fetch_metadata_and_history(
+        self, set_number: str
+    ) -> tuple[Optional[SetMetadata], list[Offer], list[tuple[str, float, str]]]:
+        url = f"https://promoklocki.pl/{set_number}"
+        status, html, _ = await http_client.get_text(url)
+        if status != 200 or not html:
+            return None, [], []
+
+        soup = BeautifulSoup(html, "lxml")
+        meta = SetMetadata(set_number=set_number)
+
+        # 1. Extract Set Title
+        h1 = soup.find("h1")
+        if h1:
+            raw_title = h1.get_text(" ", strip=True)
+            meta.name = re.sub(rf"^LEGO\s*®?\s*{re.escape(set_number)}\s*[-–:]?\s*", "", raw_title, flags=re.I).strip() or raw_title
+
+        # 2. Extract Image URL
+        og_img = soup.find("meta", property="og:image")
+        if og_img and og_img.get("content"):
+            meta.image_url = str(og_img["content"]).strip()
+        if not meta.image_url:
+            img_tag = soup.select_one("img.img-fluid, .product-image img, img[alt*='LEGO']")
+            if img_tag and img_tag.get("src"):
+                src = str(img_tag["src"])
+                meta.image_url = src if src.startswith("http") else f"https://promoklocki.pl{src}"
+
+        # 3. Extract Official LEGO.pl Catalog Price (Cena katalogowa)
+        page_text = soup.get_text(" ", strip=True)
+        cat_match = re.search(
+            r"(?:Cena\s+katalogowa|Cena\s+LEGO)[:\s]*([\d\s]+[,.]\d{2})\s*z[łl]",
+            page_text,
+            flags=re.IGNORECASE,
+        )
+        if cat_match:
+            meta.msrp_pln = parse_price_number(cat_match.group(1))
+
+        # 4. Extract Retirement / EOL hint if listed on Promoklocki
+        if re.search(r"wycofany|zakończona produkcja", page_text, flags=re.I):
+            meta.is_retired = True
+        eol_match = re.search(
+            r"(?:Wycofanie|Koniec\s+produkcji)[:\s]*(20\d{2})(?:[-/.](\d{1,2}))?",
+            page_text,
+            flags=re.I,
+        )
+        if eol_match:
+            year = int(eol_match.group(1))
+            month = int(eol_match.group(2)) if eol_match.group(2) else 12
+            meta.retirement_date = date(year, min(max(month, 1), 12), 28)
+            meta.retirement_source = "promoklocki.pl"
+
+        # 5. Parse current active store offers from Promoklocki table/rows
+        offers: list[Offer] = []
+        offer_rows = soup.select("table tr, .offer-row, .shop-offer, .row.align-items-center")
+        for idx, row in enumerate(offer_rows):
+            row_text = row.get_text(" ", strip=True)
+            if "zł" not in row_text.lower():
+                continue
+
+            link_el = row.select_one("a[href]")
+            if not link_el:
+                continue
+            href = str(link_el.get("href", "")).strip()
+            if not href or href.startswith("#") or "javascript:" in href:
+                continue
+            full_url = href if href.startswith("http") else f"https://promoklocki.pl{href}"
+
+            # Find price in PLN
+            price_matches = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I)
+            if not price_matches:
+                continue
+            item_price = parse_price_number(price_matches[0])
+            if not item_price:
+                continue
+
+            # Check if delivery cost is mentioned in the row
+            delivery_price: Optional[float] = None
+            if re.search(r"darmowa\s+dostawa|wysyłka\s+0\s*z[łl]|dostawa\s+gratis", row_text, flags=re.I):
+                delivery_price = 0.0
+            elif len(price_matches) >= 2 and "dostaw" in row_text.lower():
+                second_p = parse_price_number(price_matches[1])
+                if second_p and second_p >= item_price:
+                    delivery_price = round(second_p - item_price, 2)
+                elif second_p and second_p < 60:
+                    delivery_price = second_p
+
+            store_name = "Promoklocki Shop"
+            shop_img = row.select_one("img[alt]")
+            if shop_img and shop_img.get("alt"):
+                store_name = f"{shop_img.get('alt').strip()} (Promoklocki)"
+            elif link_el.get_text(strip=True):
+                txt = link_el.get_text(strip=True)
+                if len(txt) < 50 and "kup" not in txt.lower():
+                    store_name = f"{txt} (Promoklocki)"
+
+            title = row_text[:140]
+            if not is_authentic_and_complete_set(
+                title=f"LEGO {set_number} {title}",
+                set_number=set_number,
+                msrp_pln=meta.msrp_pln,
+                item_price_pln=item_price,
+            ):
+                continue
+
+            ext_id = re.sub(r"[^a-zA-Z0-9_-]", "", href[-32:]) or f"pk-{idx}"
+            offers.append(
+                Offer(
+                    set_number=set_number,
+                    title=f"LEGO {set_number} {meta.name or ''}".strip(),
+                    source=self.source_name,
+                    store_name=store_name,
+                    url=full_url,
+                    external_id=ext_id,
+                    item_price_original=item_price,
+                    currency_original="PLN",
+                    item_price_pln=item_price,
+                    delivery_price_pln=delivery_price,
+                    delivery_time="1-3 dni robocze",
+                    condition="New (Sealed)",
+                    image_url=meta.image_url,
+                )
+            )
+
+        # 6. Extract historical lowest price points from embedded scripts or summary text
+        history_points: list[tuple[str, float, str]] = []
+        for script in soup.find_all("script"):
+            stext = script.string or ""
+            # Look for date + price arrays often embedded in chart configurations
+            pairs = re.findall(
+                r'["\'](20\d{2}-\d{2}-\d{2})["\']\s*[,:]\s*(\d+(?:\.\d{1,2})?)',
+                stext,
+            )
+            for dt_str, p_str in pairs:
+                try:
+                    pval = float(p_str)
+                    if pval > 10:
+                        history_points.append((dt_str, pval, "promoklocki.pl"))
+                except ValueError:
+                    pass
+
+        return meta, offers, history_points
+
+    async def fetch_metadata(self, set_number: str) -> Optional[SetMetadata]:
+        meta, _, _ = await self.fetch_metadata_and_history(set_number)
+        return meta
+
+    async def fetch_offers(
+        self,
+        set_number: str,
+        msrp_pln: Optional[float] = None,
+    ) -> list[Offer]:
+        _, offers, _ = await self.fetch_metadata_and_history(set_number)
+        return offers

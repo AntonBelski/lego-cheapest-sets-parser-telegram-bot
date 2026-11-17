@@ -1,0 +1,637 @@
+from __future__ import annotations
+
+import html
+import logging
+from typing import Optional
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+
+from bot.config import settings
+from bot.db import Database
+from bot.services.chart import render_deal_card_with_chart
+from bot.services.currency import currency_converter
+from bot.services.http_client import http_client
+from bot.services.monitor import LegoMonitorService
+
+logger = logging.getLogger(__name__)
+
+
+class SubscriptionForm(StatesGroup):
+    waiting_for_set_number = State()
+    waiting_for_price_from = State()
+    waiting_for_price_to = State()
+
+
+def parse_optional_bound(raw: str, is_min: bool) -> Optional[float]:
+    """
+    Parse user input for price_from or price_to.
+    If skipped ('-', 'skip', 'none', 'inf', 'infinity', '0' for min), returns:
+    - 0.0 for price_from
+    - None (infinity) for price_to
+    """
+    cleaned = (raw or "").strip().lower().replace("pln", "").replace("zł", "").strip()
+    if cleaned in ("", "-", "skip", "none", "null", "inf", "infinity", "∞", "pomiń"):
+        return 0.0 if is_min else None
+    val = float(cleaned.replace(",", "."))
+    if val <= 0:
+        return 0.0 if is_min else None
+    return round(val, 2)
+
+
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Add LEGO Set", callback_data="menu:add"),
+                InlineKeyboardButton(text="📋 My Subscribed Sets", callback_data="menu:list"),
+            ],
+            [
+                InlineKeyboardButton(text="🔄 Check Prices Now", callback_data="menu:check_all"),
+                InlineKeyboardButton(text="⏳ Retirement Dates", callback_data="menu:retire"),
+            ],
+            [
+                InlineKeyboardButton(text="📡 Scraper & FX Status", callback_data="menu:status"),
+            ],
+        ]
+    )
+
+
+def set_actions_keyboard(set_number: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"🔍 Check {set_number}", callback_data=f"set:check:{set_number}"),
+                InlineKeyboardButton(text=f"📈 Chart {set_number}", callback_data=f"set:chart:{set_number}"),
+                InlineKeyboardButton(text=f"🛒 Top Deals", callback_data=f"set:deals:{set_number}"),
+            ],
+            [
+                InlineKeyboardButton(text=f"✏️ Edit Price Range", callback_data=f"set:edit:{set_number}"),
+                InlineKeyboardButton(text=f"🗑 Remove {set_number}", callback_data=f"set:remove:{set_number}"),
+            ],
+        ]
+    )
+
+
+def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
+    dp = Dispatcher(storage=MemoryStorage())
+    router = Router()
+    dp.include_router(router)
+
+    def _is_authorized(chat_id: int) -> bool:
+        if settings.telegram_chat_id is None:
+            return True
+        return chat_id == settings.telegram_chat_id
+
+    @router.message(Command("start", "help"))
+    async def cmd_start(message: Message, state: FSMContext) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        await state.clear()
+        text = (
+            "🧱 <b>LEGO Poland & EU Cheapest Set Tracker Bot</b>\n\n"
+            "I check <b>13 Polish & European marketplaces/retailers</b> every <b>5 minutes</b> "
+            "for <b>New (Sealed)</b> and <b>Open Box (Sealed Bags)</b> original LEGO sets, "
+            "convert all currencies to <b>PLN</b> (NBP real-time rates), include cheapest delivery, "
+            "and track set <b>retirement dates</b> every 5 days.\n\n"
+            "<b>Monitored Sites:</b>\n"
+            "• <code>olx.pl</code>, <code>vinted.pl</code>, <code>allegrolokalnie.pl</code>, <code>allegro.pl</code>\n"
+            "• <code>promoklocki.pl</code>, <code>klocki.app</code>, <code>ceneo.pl</code>\n"
+            "• <code>brickmerge.de</code> (Amazon DE/FR/ES/IT & EU stores), <code>ebay.pl</code>, <code>bricklink.com</code>\n"
+            "• <code>smyk.com</code>, <code>empik.com</code>, <code>mediaexpert.pl</code>\n\n"
+            "<b>Commands:</b>\n"
+            "• /add — Add a set interactively (with <b>Skip</b> for 0 or ∞)\n"
+            "• <code>/add 10316 - 1750</code> — Quick add (Price From = 0 PLN, Price To = 1750 PLN)\n"
+            "• /list — View & manage your subscribed sets\n"
+            "• <code>/deals 10316</code> — Show cheapest current offers across all sites\n"
+            "• <code>/chart 10316</code> — View set image + daily lowest price chart\n"
+            "• <code>/check [set]</code> — Force an immediate scan\n"
+            "• /retire — Check retirement dates & countdowns\n"
+            "• /status — View scraper health & NBP FX rates\n"
+            "• <code>/remove 10316</code> — Unsubscribe from a set"
+        )
+        await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
+
+    # -------------------------------------------------------------------------
+    # /add Command & Interactive Wizard (Price From / Price To with Skip)
+    # -------------------------------------------------------------------------
+    @router.message(Command("add"))
+    async def cmd_add(message: Message, command: CommandObject, state: FSMContext) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+
+        args = (command.args or "").strip().split()
+        if args:
+            # Quick syntax: /add <set_number> [price_from|-] [price_to|-]
+            set_number = args[0].strip()
+            if not set_number.isdigit():
+                await message.answer("❌ Set number must be digits (e.g. <code>10316</code>).", parse_mode="HTML")
+                return
+            try:
+                p_from = parse_optional_bound(args[1], is_min=True) if len(args) >= 2 else 0.0
+                p_to = parse_optional_bound(args[2], is_min=False) if len(args) >= 3 else None
+            except ValueError:
+                await message.answer(
+                    "❌ Invalid price format. Example: <code>/add 10316 - 1750</code> or <code>/add 10316 1200 1750</code>",
+                    parse_mode="HTML",
+                )
+                return
+
+            await _finalize_subscription(message, message.chat.id, set_number, p_from or 0.0, p_to)
+            return
+
+        # Start interactive wizard
+        await state.set_state(SubscriptionForm.waiting_for_set_number)
+        await message.answer(
+            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>10316</code> or <code>75192</code>):",
+            parse_mode="HTML",
+        )
+
+    @router.callback_query(F.data == "menu:add")
+    async def cb_menu_add(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        await state.set_state(SubscriptionForm.waiting_for_set_number)
+        await callback.message.answer(
+            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>10316</code>):",
+            parse_mode="HTML",
+        )
+
+    @router. callback_query(F.data.startswith("set:edit:"))
+    async def cb_edit_set(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        set_number = (callback.data or "").split(":")[-1]
+        await state.update_data(set_number=set_number)
+        await state.set_state(SubscriptionForm.waiting_for_price_from)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ Skip Price From (0 PLN)", callback_data="wiz:skip_from")]
+            ]
+        )
+        await callback.message.answer(
+            f"✏️ Editing <b>LEGO {html.escape(set_number)}</b>\n\n"
+            f"💰 <b>Step 2/3:</b> Enter <b>Price From (PLN)</b>, or click <b>Skip (0 PLN)</b>:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    @router.message(SubscriptionForm.waiting_for_set_number)
+    async def process_set_number(message: Message, state: FSMContext) -> None:
+        raw = (message.text or "").strip()
+        if not raw.isdigit():
+            await message.answer("❌ Please enter a numeric LEGO set number (e.g. <code>10316</code>):", parse_mode="HTML")
+            return
+        await state.update_data(set_number=raw)
+        await state.set_state(SubscriptionForm.waiting_for_price_from)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ Skip Price From (0 PLN)", callback_data="wiz:skip_from")]
+            ]
+        )
+        await message.answer(
+            f"✅ Set <b>LEGO {html.escape(raw)}</b> selected.\n\n"
+            f"💰 <b>Step 2/3:</b> Enter minimum price <b>Price From (PLN)</b>, or press <b>Skip (0 PLN)</b>:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    @router.callback_query(F.data == "wiz:skip_from")
+    async def cb_skip_price_from(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.message:
+            return
+        await callback.answer("Price From set to 0 PLN")
+        await state.update_data(price_from=0.0)
+        await state.set_state(SubscriptionForm.waiting_for_price_to)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ Skip Price To (∞ Infinity)", callback_data="wiz:skip_to")]
+            ]
+        )
+        await callback.message.answer(
+            "💰 <b>Step 3/3:</b> Enter maximum price <b>Price To (PLN)</b> (e.g. <code>1750</code>), "
+            "or press <b>Skip (∞ Infinity)</b>:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    @router.message(SubscriptionForm.waiting_for_price_from)
+    async def process_price_from(message: Message, state: FSMContext) -> None:
+        try:
+            p_from = parse_optional_bound(message.text or "", is_min=True) or 0.0
+        except ValueError:
+            await message.answer("❌ Please enter a valid number in PLN or <code>-</code> to skip:", parse_mode="HTML")
+            return
+
+        await state.update_data(price_from=p_from)
+        await state.set_state(SubscriptionForm.waiting_for_price_to)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⏭ Skip Price To (∞ Infinity)", callback_data="wiz:skip_to")]
+            ]
+        )
+        await message.answer(
+            f"✅ Price From: <b>{p_from:.0f} PLN</b>.\n\n"
+            f"💰 <b>Step 3/3:</b> Enter maximum price <b>Price To (PLN)</b>, or press <b>Skip (∞ Infinity)</b>:",
+            parse_mode="HTML",
+            reply_markup=kb,
+        )
+
+    @router.callback_query(F.data == "wiz:skip_to")
+    async def cb_skip_price_to(callback: CallbackQuery, state: FSMContext) -> None:
+        if not callback.message:
+            return
+        await callback.answer("Price To set to ∞ Infinity")
+        data = await state.get_data()
+        await state.clear()
+        set_number = data.get("set_number", "")
+        p_from = float(data.get("price_from", 0.0) or 0.0)
+        await _finalize_subscription(callback.message, callback.message.chat.id, set_number, p_from, None)
+
+    @router.message(SubscriptionForm.waiting_for_price_to)
+    async def process_price_to(message: Message, state: FSMContext) -> None:
+        try:
+            p_to = parse_optional_bound(message.text or "", is_min=False)
+        except ValueError:
+            await message.answer("❌ Please enter a valid number in PLN or <code>-</code> to skip:", parse_mode="HTML")
+            return
+
+        data = await state.get_data()
+        await state.clear()
+        set_number = data.get("set_number", "")
+        p_from = float(data.get("price_from", 0.0) or 0.0)
+        if p_to is not None and p_to < p_from:
+            p_from, p_to = p_to, p_from
+        await _finalize_subscription(message, message.chat.id, set_number, p_from, p_to)
+
+    async def _finalize_subscription(
+        msg: Message,
+        chat_id: int,
+        set_number: str,
+        price_from: float,
+        price_to: Optional[float],
+    ) -> None:
+        sub = await db.upsert_subscription(
+            chat_id=chat_id,
+            set_number=set_number,
+            price_from=price_from,
+            price_to=price_to,
+        )
+        status_msg = await msg.answer(
+            f"⏳ Subscribed to <b>LEGO {html.escape(set_number)}</b> "
+            f"(Range: <b>{html.escape(sub.formatted_range)}</b>).\n"
+            f"Fetching LEGO.pl MSRP, historical prices, and scanning stores...",
+            parse_mode="HTML",
+        )
+        meta = await monitor.enrich_set_on_subscribe(set_number)
+        updated_sub = await db.get_subscription(chat_id, set_number) or sub
+        stats = await db.get_price_stats(set_number)
+
+        msrp_str = f"{updated_sub.msrp_pln:.2f} PLN" if updated_sub.msrp_pln else "Fetching on next scan"
+        low30_str = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "Scanning..."
+        lowall_str = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "Scanning..."
+
+        await status_msg.edit_text(
+            f"✅ <b>Subscription Active: LEGO {html.escape(set_number)}</b>\n"
+            f"🧱 <b>Name:</b> {html.escape(updated_sub.set_name or (meta.name if meta else 'LEGO Set'))}\n"
+            f"🎯 <b>Your Price Range:</b> <b>{html.escape(updated_sub.formatted_range)}</b>\n"
+            f"🏷 <b>LEGO.pl MSRP:</b> {msrp_str}\n"
+            f"📉 <b>Lowest (30d):</b> {low30_str}\n"
+            f"🏆 <b>Lowest (All-Time):</b> {lowall_str}\n\n"
+            f"<i>I will check all 13 sites every 5 minutes and notify you with the set photo & daily price chart whenever a new offer appears in your range!</i>",
+            parse_mode="HTML",
+            reply_markup=set_actions_keyboard(set_number),
+        )
+
+    # -------------------------------------------------------------------------
+    # /list & Subscription Management
+    # -------------------------------------------------------------------------
+    @router.message(Command("list"))
+    async def cmd_list(message: Message) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        await _send_subscriptions_list(message, message.chat.id)
+
+    @router.callback_query(F.data == "menu:list")
+    async def cb_menu_list(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        await _send_subscriptions_list(callback.message, callback.message.chat.id)
+
+    async def _send_subscriptions_list(msg: Message, chat_id: int) -> None:
+        subs = await db.list_subscriptions(chat_id=chat_id)
+        if not subs:
+            await msg.answer(
+                "📭 You don't have any active LEGO set subscriptions yet.\n"
+                "Click <b>➕ Add LEGO Set</b> or use <code>/add 10316 - 1750</code>.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        await msg.answer(
+            f"📋 <b>Your Subscribed LEGO Sets ({len(subs)}):</b>",
+            parse_mode="HTML",
+        )
+        for sub in subs:
+            stats = await db.get_price_stats(sub.set_number)
+            msrp_txt = f"{sub.msrp_pln:.2f} PLN" if sub.msrp_pln else "N/A"
+            low30_txt = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "N/A"
+            lowall_txt = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "N/A"
+            ret_txt = f"{sub.retirement_date} ({sub.retirement_source})" if sub.retirement_date else "Not announced yet"
+
+            card_text = (
+                f"🧱 <b>LEGO {html.escape(sub.set_number)} — {html.escape(sub.set_name or 'LEGO Set')}</b>\n"
+                f"🎯 <b>Target Price Range:</b> <b>{html.escape(sub.formatted_range)}</b>\n"
+                f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_txt}\n"
+                f"📉 <b>Lowest (Last 30 Days):</b> {low30_txt}\n"
+                f"🏆 <b>Lowest (All Time):</b> {lowall_txt}\n"
+                f"⏳ <b>Retirement Date:</b> {html.escape(ret_txt)}"
+            )
+            await msg.answer(
+                card_text,
+                parse_mode="HTML",
+                reply_markup=set_actions_keyboard(sub.set_number),
+            )
+
+    # -------------------------------------------------------------------------
+    # /remove Command & Callback
+    # -------------------------------------------------------------------------
+    @router.message(Command("remove"))
+    async def cmd_remove(message: Message, command: CommandObject) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        set_number = (command.args or "").strip()
+        if not set_number:
+            await message.answer("Usage: <code>/remove 10316</code>", parse_mode="HTML")
+            return
+        removed = await db.remove_subscription(message.chat.id, set_number)
+        if removed:
+            await message.answer(f"🗑 Removed <b>LEGO {html.escape(set_number)}</b> from your subscriptions.", parse_mode="HTML")
+        else:
+            await message.answer(f"⚠️ Set <b>{html.escape(set_number)}</b> was not in your subscriptions.", parse_mode="HTML")
+
+    @router.callback_query(F.data.startswith("set:remove:"))
+    async def cb_remove_set(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        set_number = (callback.data or "").split(":")[-1]
+        await db.remove_subscription(callback.message.chat.id, set_number)
+        await callback.answer(f"Removed LEGO {set_number}")
+        await callback.message.edit_text(
+            f"🗑 Unsubscribed from <b>LEGO {html.escape(set_number)}</b>.",
+            parse_mode="HTML",
+        )
+
+    # -------------------------------------------------------------------------
+    # /chart Command & Callback (Set Image + Daily Lowest Price Dynamics)
+    # -------------------------------------------------------------------------
+    @router.message(Command("chart"))
+    async def cmd_chart(message: Message, command: CommandObject) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        set_number = (command.args or "").strip()
+        if not set_number:
+            await message.answer("Usage: <code>/chart 10316</code>", parse_mode="HTML")
+            return
+        await _send_chart_for_set(message, message.chat.id, set_number)
+
+    @router.callback_query(F.data.startswith("set:chart:"))
+    async def cb_chart_set(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer("Generating price chart...")
+        set_number = (callback.data or "").split(":")[-1]
+        await _send_chart_for_set(callback.message, callback.message.chat.id, set_number)
+
+    async def _send_chart_for_set(msg: Message, chat_id: int, set_number: str) -> None:
+        sub = await db.get_subscription(chat_id, set_number)
+        if not sub:
+            sub = await db.upsert_subscription(chat_id, set_number, 0.0, None)
+            await monitor.enrich_set_on_subscribe(set_number)
+            sub = await db.get_subscription(chat_id, set_number) or sub
+
+        stats = await db.get_price_stats(set_number)
+        latest = await db.get_latest_offers(set_number, limit=1)
+        curr_best = float(latest[0]["total_price_pln"]) if latest else stats.lowest_30d_pln
+
+        png_bytes = await render_deal_card_with_chart(sub, stats, current_best_pln=curr_best)
+        photo = BufferedInputFile(png_bytes, filename=f"lego_{set_number}_chart.png")
+
+        caption = (
+            f"📈 <b>Daily Lowest Price Dynamics: LEGO {html.escape(set_number)}</b>\n"
+            f"🧱 <b>{html.escape(sub.set_name or '')}</b>\n"
+            f"🏷 <b>LEGO.pl MSRP:</b> {f'{sub.msrp_pln:.2f} PLN' if sub.msrp_pln else 'N/A'}\n"
+            f"📉 <b>Lowest (Last 30 Days):</b> {f'{stats.lowest_30d_pln:.2f} PLN ({stats.lowest_30d_source})' if stats.lowest_30d_pln else 'N/A'}\n"
+            f"🏆 <b>Lowest (All Time):</b> {f'{stats.lowest_all_time_pln:.2f} PLN ({stats.lowest_all_time_source})' if stats.lowest_all_time_pln else 'N/A'}\n"
+            f"🎯 <b>Your Range:</b> {html.escape(sub.formatted_range)}"
+        )
+        await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
+
+    # -------------------------------------------------------------------------
+    # /deals Command & Callback (Show Top Cheapest Offers Across All Sites)
+    # -------------------------------------------------------------------------
+    @router.message(Command("deals"))
+    async def cmd_deals(message: Message, command: CommandObject) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        set_number = (command.args or "").strip()
+        if not set_number:
+            await message.answer("Usage: <code>/deals 10316</code>", parse_mode="HTML")
+            return
+        await _send_top_deals(message, set_number)
+
+    @router.callback_query(F.data.startswith("set:deals:"))
+    async def cb_deals_set(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        set_number = (callback.data or "").split(":")[-1]
+        await _send_top_deals(callback.message, set_number)
+
+    async def _send_top_deals(msg: Message, set_number: str) -> None:
+        rows = await db.get_latest_offers(set_number, limit=10)
+        if not rows:
+            wait_m = await msg.answer(f"🔍 Scanning live offers for <b>LEGO {html.escape(set_number)}</b>...", parse_mode="HTML")
+            await monitor.scan_single_set(set_number)
+            rows = await db.get_latest_offers(set_number, limit=10)
+            await wait_m.delete()
+
+        if not rows:
+            await msg.answer(f"No offers found yet for <b>LEGO {html.escape(set_number)}</b>.", parse_mode="HTML")
+            return
+
+        stats = await db.get_price_stats(set_number)
+        lines = [
+            f"🛒 <b>Top Cheapest Current Offers: LEGO {html.escape(set_number)}</b>",
+            f"📉 30d Low: <b>{f'{stats.lowest_30d_pln:.2f} PLN' if stats.lowest_30d_pln else 'N/A'}</b> | "
+            f"🏆 All-Time Low: <b>{f'{stats.lowest_all_time_pln:.2f} PLN' if stats.lowest_all_time_pln else 'N/A'}</b>",
+            "",
+        ]
+        for idx, r in enumerate(rows, start=1):
+            total_p = float(r["total_price_pln"])
+            deliv_known = bool(r["delivery_known"])
+            deliv_p = r["delivery_price_pln"]
+            if not deliv_known or deliv_p is None:
+                p_str = f"{total_p:.2f} PLN (+delivery)"
+            elif float(deliv_p) == 0:
+                p_str = f"{total_p:.2f} PLN (free delivery)"
+            else:
+                p_str = f"{total_p:.2f} PLN (incl. {float(deliv_p):.2f} delivery)"
+
+            lines.append(
+                f"{idx}. <a href=\"{html.escape(str(r['url']))}\"><b>{html.escape(str(r['store_name']))}</b></a> — "
+                f"<b>{p_str}</b> [<i>{html.escape(str(r['condition']))}</i>]"
+            )
+
+        await msg.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+
+    # -------------------------------------------------------------------------
+    # /check Command & Callbacks (Immediate Scan)
+    # -------------------------------------------------------------------------
+    @router.message(Command("check"))
+    async def cmd_check(message: Message, command: CommandObject) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        set_number = (command.args or "").strip()
+        if set_number:
+            wait = await message.answer(f"🔍 Scanning all 13 sites for <b>LEGO {html.escape(set_number)}</b>...", parse_mode="HTML")
+            offers = await monitor.scan_single_set(set_number)
+            best_str = offers[0].formatted_price if offers else "No offers found"
+            await wait.edit_text(
+                f"✅ Scan finished for <b>LEGO {html.escape(set_number)}</b>: "
+                f"found <b>{len(offers)}</b> valid offers.\n"
+                f"💰 Cheapest right now: <b>{html.escape(best_str)}</b>",
+                parse_mode="HTML",
+                reply_markup=set_actions_keyboard(set_number),
+            )
+        else:
+            wait = await message.answer("🔄 Scanning all subscribed LEGO sets across all 13 sites...", parse_mode="HTML")
+            res = await monitor.scan_all_subscribed_sets()
+            total_found = sum(len(v) for v in res.values())
+            await wait.edit_text(
+                f"✅ Full scan complete! Checked <b>{len(res)}</b> sets, recorded <b>{total_found}</b> valid offers.",
+                parse_mode="HTML",
+            )
+
+    @router.callback_query(F.data == "menu:check_all")
+    async def cb_check_all(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer("Starting scan...")
+        wait = await callback.message.answer("🔄 Scanning all subscribed LEGO sets across all 13 sites...", parse_mode="HTML")
+        res = await monitor.scan_all_subscribed_sets()
+        total_found = sum(len(v) for v in res.values())
+        await wait.edit_text(
+            f"✅ Full scan complete! Checked <b>{len(res)}</b> sets, recorded <b>{total_found}</b> valid offers.",
+            parse_mode="HTML",
+        )
+
+    @router.callback_query(F.data.startswith("set:check:"))
+    async def cb_check_single(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer("Scanning set...")
+        set_number = (callback.data or "").split(":")[-1]
+        wait = await callback.message.answer(f"🔍 Scanning 13 sites for <b>LEGO {html.escape(set_number)}</b>...", parse_mode="HTML")
+        offers = await monitor.scan_single_set(set_number)
+        best_str = offers[0].formatted_price if offers else "No offers found"
+        await wait.edit_text(
+            f"✅ Scan complete for <b>LEGO {html.escape(set_number)}</b>: "
+            f"found <b>{len(offers)}</b> offers.\n"
+            f"💰 Cheapest: <b>{html.escape(best_str)}</b>",
+            parse_mode="HTML",
+            reply_markup=set_actions_keyboard(set_number),
+        )
+
+    # -------------------------------------------------------------------------
+    # /retire Command & Callback (Retirement Dates)
+    # -------------------------------------------------------------------------
+    @router.message(Command("retire"))
+    async def cmd_retire(message: Message) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        wait = await message.answer("⏳ Checking retirement dates on Brickset, BrickEconomy & Promoklocki...", parse_mode="HTML")
+        summaries = await monitor.check_all_retirement_dates(force_report_chat_id=message.chat.id)
+        if not summaries:
+            await wait.edit_text("📭 No subscribed sets to check. Use /add first!", parse_mode="HTML")
+            return
+        await wait.edit_text(
+            "⏳ <b>Subscribed LEGO Sets Retirement Status:</b>\n\n" + "\n".join(summaries),
+            parse_mode="HTML",
+        )
+
+    @router.callback_query(F.data == "menu:retire")
+    async def cb_menu_retire(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer("Checking retirement dates...")
+        wait = await callback.message.answer("⏳ Checking retirement dates on Brickset, BrickEconomy & Promoklocki...", parse_mode="HTML")
+        summaries = await monitor.check_all_retirement_dates(force_report_chat_id=callback.message.chat.id)
+        if not summaries:
+            await wait.edit_text("📭 No subscribed sets to check.", parse_mode="HTML")
+            return
+        await wait.edit_text(
+            "⏳ <b>Subscribed LEGO Sets Retirement Status:</b>\n\n" + "\n".join(summaries),
+            parse_mode="HTML",
+        )
+
+    # -------------------------------------------------------------------------
+    # /status Command & Callback (Scraper Health + NBP FX Rates + Call Math)
+    # -------------------------------------------------------------------------
+    @router.message(Command("status"))
+    async def cmd_status(message: Message) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        await _send_status_report(message)
+
+    @router.callback_query(F.data == "menu:status")
+    async def cb_menu_status(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        await _send_status_report(callback.message)
+
+    async def _send_status_report(msg: Message) -> None:
+        await currency_converter.refresh_if_needed()
+        health_rows = await db.get_scraper_health()
+
+        lines = [
+            "📡 <b>System, Anti-Block & FX Rate Status</b>",
+            "",
+            "💱 <b>Real-Time NBP Exchange Rates (to PLN):</b>",
+            f"• 1 EUR = <b>{currency_converter.get_rate('EUR'):.4f} PLN</b>",
+            f"• 1 USD = <b>{currency_converter.get_rate('USD'):.4f} PLN</b>",
+            f"• 1 GBP = <b>{currency_converter.get_rate('GBP'):.4f} PLN</b>",
+            f"• 1 CZK = <b>{currency_converter.get_rate('CZK'):.4f} PLN</b>",
+            "",
+            f"🛡 <b>Anti-Block Client:</b> curl_cffi TLS Impersonation | Requests made: <code>{http_client.total_requests_made}</code>",
+            "",
+            "🌐 <b>Marketplace Parsers Health:</b>",
+        ]
+        if not health_rows:
+            lines.append("<i>No scan runs recorded yet. Run /check to test all sites.</i>")
+        else:
+            for r in health_rows:
+                icon = "✅" if r["last_status"] == "OK" else "⚠️"
+                lines.append(
+                    f"{icon} <code>{html.escape(str(r['source']))}</code>: "
+                    f"<b>{r['offers_count']} offers</b> ({r['last_run_at']})"
+                )
+
+        await msg.answer("\n".join(lines), parse_mode="HTML")
+
+    return dp
