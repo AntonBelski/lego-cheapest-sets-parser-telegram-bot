@@ -44,11 +44,11 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore SQLite database from orphan state branch (if exists)
+      - name: Restore SQLite database & run logs from orphan state branch (if exists)
         run: |
           mkdir -p data
           git fetch origin db-state:db-state 2>/dev/null || true
-          git checkout db-state -- data/lego_tracker.db 2>/dev/null || true
+          git checkout db-state -- data/lego_tracker.db data/scraper_runs.log 2>/dev/null || true
 
       - name: Run LEGO Price & Telegram Command Scanner
         env:
@@ -70,7 +70,7 @@ jobs:
             python -m bot.main --once
           fi
 
-      - name: Persist SQLite database to dedicated `db-state` branch (keeps `main` history clean)
+      - name: Persist SQLite database & run logs to dedicated `db-state` branch
         if: always()
         run: |
           if [ -f data/lego_tracker.db ]; then
@@ -79,7 +79,10 @@ jobs:
             git checkout --orphan temp-db-state
             git rm -rf --cached . >/dev/null 2>&1 || true
             git add -f data/lego_tracker.db
-            git commit -m "Update LEGO tracker SQLite state" || true
+            if [ -f data/scraper_runs.log ]; then
+              git add -f data/scraper_runs.log
+            fi
+            git commit -m "Update LEGO tracker SQLite state and run logs" || true
             git branch -M temp-db-state db-state
             git push -f origin db-state
           fi

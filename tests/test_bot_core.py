@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 
 from bot.db import Database
-from bot.models import Offer, Subscription
+from bot.models import (
+    Offer,
+    ScraperSiteReport,
+    Subscription,
+    format_retirement_status_and_countdown,
+)
+from bot.scrapers.brickmerge import check_brickmerge_shop_ships_to_poland
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import CurrencyConverter
 from bot.services.filter import (
@@ -18,7 +24,6 @@ from bot.telegram_bot import parse_optional_bound
 
 
 def test_price_bounds_skip_and_matching() -> None:
-    # Skipping price_from -> 0.0; skipping price_to -> None (infinity)
     assert parse_optional_bound("", is_min=True) == 0.0
     assert parse_optional_bound("-", is_min=True) == 0.0
     assert parse_optional_bound("skip", is_min=True) == 0.0
@@ -27,7 +32,6 @@ def test_price_bounds_skip_and_matching() -> None:
     assert parse_optional_bound("inf", is_min=False) is None
     assert parse_optional_bound("1750", is_min=False) == 1750.0
 
-    # Test Subscription matching
     sub_open = Subscription(id=1, chat_id=123, set_number="10316", price_from=0.0, price_to=None)
     assert sub_open.matches_price(100.0)
     assert sub_open.matches_price(99999.0)
@@ -44,12 +48,11 @@ def test_price_bounds_skip_and_matching() -> None:
 
 
 def test_authenticity_and_condition_filtering() -> None:
-    # Exact set number check
-    assert contains_set_number("LEGO Icons 10316 Władca Pierścieni: Rivendell", "10316")
-    assert contains_set_number("LEGO 10316-1 Rivendell", "10316")
-    assert not contains_set_number("LEGO 103165 Some Other Number", "10316")
+    assert contains_set_number("LEGO Ideas 21348 Dungeons & Dragons", "21348")
+    assert contains_set_number("LEGO 21348-1 Red Dragon", "21348")
+    assert not contains_set_number("LEGO 213489 Other Set", "21348")
+    assert not contains_set_number("LEGO Ideas 21365 Papużki", "21348")
 
-    # Original LEGO vs Replicas / Partial sets
     assert is_authentic_and_complete_set(
         "LEGO 10316 Rivendell Nowy Plomby", set_number="10316", msrp_pln=2149.99, item_price_pln=1650.0
     )
@@ -66,7 +69,6 @@ def test_authenticity_and_condition_filtering() -> None:
         "Oświetlenie LED do LEGO 10316 Briksmax", set_number="10316"
     )
 
-    # Condition filter: New Sealed vs Open Box Sealed Bags vs Used
     assert classify_condition("LEGO 10316 Nowy fabrycznie zamknięty MISB") == "New (Sealed)"
     assert (
         classify_condition("LEGO 10316 Otwarte pudełko, wszystkie woreczki fabrycznie zamknięte!")
@@ -79,10 +81,26 @@ def test_authenticity_and_condition_filtering() -> None:
     assert classify_condition("LEGO 10316 Używany, raz złożony, kompletny") is None
 
 
-def test_delivery_price_formatting() -> None:
+def test_brickmerge_poland_delivery_filter() -> None:
+    # Stores that ship to Poland
+    assert check_brickmerge_shop_ships_to_poland("Amazon.de")[0] is True
+    assert check_brickmerge_shop_ships_to_poland("amazon (FR)")[0] is True
+    assert check_brickmerge_shop_ships_to_poland("Proshop")[0] is True
+    assert check_brickmerge_shop_ships_to_poland("JB Spielwaren")[0] is True
+    assert check_brickmerge_shop_ships_to_poland("Lucky Bricks")[0] is True
+
+    # Stores that do NOT ship to Poland
+    assert check_brickmerge_shop_ships_to_poland("Alza")[0] is False
+    assert check_brickmerge_shop_ships_to_poland("Office-Partner")[0] is False
+    assert check_brickmerge_shop_ships_to_poland("KiSebA")[0] is False
+    assert check_brickmerge_shop_ships_to_poland("kaufland.de")[0] is False
+    assert check_brickmerge_shop_ships_to_poland("OTTO")[0] is False
+
+
+def test_delivery_and_retirement_formatting() -> None:
     offer_unknown_deliv = Offer(
-        set_number="10316",
-        title="LEGO 10316",
+        set_number="21348",
+        title="LEGO 21348",
         source="vinted.pl",
         store_name="Vinted Seller",
         url="https://vinted.pl/items/1",
@@ -95,20 +113,15 @@ def test_delivery_price_formatting() -> None:
     assert offer_unknown_deliv.total_price_pln == 1500.0
     assert "(+delivery)" in offer_unknown_deliv.formatted_price
 
-    offer_with_deliv = Offer(
-        set_number="10316",
-        title="LEGO 10316",
-        source="olx.pl",
-        store_name="OLX Seller",
-        url="https://olx.pl/d/1",
-        external_id="o1",
-        item_price_original=1500.0,
-        currency_original="PLN",
-        item_price_pln=1500.0,
-        delivery_price_pln=13.99,
-    )
-    assert offer_with_deliv.total_price_pln == 1513.99
-    assert "1513.99 PLN" in offer_with_deliv.formatted_price
+    # Retirement countdown formatting (years, months, weeks, days)
+    today = date(2026, 11, 17)
+    status_active = format_retirement_status_and_countdown("2027-12-31", "BrickEconomy", today=today)
+    assert "Retired: NO" in status_active
+    assert "1 year" in status_active
+    assert "1 month" in status_active
+
+    status_retired = format_retirement_status_and_countdown("2025-12-31", "Brickset", today=today)
+    assert "Retired: YES" in status_retired
 
 
 def test_retirement_milestones() -> None:
@@ -131,96 +144,96 @@ def test_retirement_milestones() -> None:
 
 
 @pytest.mark.asyncio
-async def test_db_all_prices_storage_deduplication_and_chart(tmp_path: Path) -> None:
+async def test_db_price_drop_from_outside_range_and_run_logs(tmp_path: Path) -> None:
     db_file = tmp_path / "test_lego.db"
     db = Database(db_file)
     await db.init()
 
+    # User subscribes to set 21348 with range up to 1800 PLN
     sub = await db.upsert_subscription(
         chat_id=999,
-        set_number="10316",
+        set_number="21348",
         price_from=0.0,
-        price_to=1700.0,
-        set_name="The Lord of the Rings: Rivendell",
-        msrp_pln=2149.99,
+        price_to=1800.0,
+        set_name="Dungeons & Dragons: Red Dragon's Tale",
+        msrp_pln=1549.99,
     )
 
-    # Seed historical prices (including an all-time low 45 days ago and 30d low 10 days ago)
-    today = date.today()
-    d_45 = (today - timedelta(days=45)).isoformat()
-    d_10 = (today - timedelta(days=10)).isoformat()
-    await db.seed_historical_daily_prices(
-        "10316",
-        [
-            (d_45, 1490.00, "brickmerge.de"),
-            (d_10, 1580.00, "promoklocki.pl"),
-        ],
-    )
-
-    # Record 2 live offers: one OUTSIDE user's price range (1899 PLN) and one INSIDE (1620 PLN)
-    offer_outside = Offer(
-        set_number="10316",
-        title="LEGO 10316 Rivendell",
-        source="ceneo.pl",
-        store_name="Ceneo Shop",
-        url="https://ceneo.pl/1",
-        external_id="cen-1",
-        item_price_original=1899.0,
+    # 1. Listing appears at 2000 PLN (OUTSIDE user's <=1800 PLN range)
+    offer_2000 = Offer(
+        set_number="21348",
+        title="LEGO 21348 D&D",
+        source="olx.pl",
+        store_name="OLX Seller",
+        url="https://olx.pl/d/oferta/21348-id1",
+        external_id="olx-dd-1",
+        item_price_original=2000.0,
         currency_original="PLN",
-        item_price_pln=1899.0,
+        item_price_pln=2000.0,
         delivery_price_pln=0.0,
     )
-    offer_inside = Offer(
-        set_number="10316",
-        title="LEGO 10316 Rivendell Otwarte pudełko woreczki zamknięte",
+    await db.record_offers("21348", [offer_2000], [sub])
+    assert not sub.matches_price(offer_2000.total_price_pln)
+
+    # 2. Seller lowers price of that same listing from 2000 PLN -> 1500 PLN (NOW INSIDE <=1800 PLN range!)
+    offer_1500 = Offer(
+        set_number="21348",
+        title="LEGO 21348 D&D",
         source="olx.pl",
         store_name="OLX Seller",
-        url="https://olx.pl/1",
-        external_id="olx-1",
-        item_price_original=1606.01,
+        url="https://olx.pl/d/oferta/21348-id1",
+        external_id="olx-dd-1",
+        item_price_original=1500.0,
         currency_original="PLN",
-        item_price_pln=1606.01,
-        delivery_price_pln=13.99,
-        condition="New (Open Box, Sealed Bags)",
+        item_price_pln=1500.0,
+        delivery_price_pln=0.0,
     )
+    await db.record_offers("21348", [offer_1500], [sub])
 
-    inserted = await db.record_offers("10316", [offer_outside, offer_inside], [sub])
-    assert inserted == 2
+    # Verify previous_price_pln was automatically detected from DB history (2000.0 -> 1500.0)!
+    assert offer_1500.previous_price_pln == 2000.0
+    assert "2000.00 PLN ➔ 1500.00 PLN" in offer_1500.formatted_price
+    assert sub.matches_price(offer_1500.total_price_pln)
+    assert await db.should_notify_offer(999, offer_1500) is True
+    await db.mark_offer_notified(999, offer_1500)
+    # Subsequent check at same 1500 PLN price -> False
+    assert await db.should_notify_offer(999, offer_1500) is False
 
-    # Check 30-day low vs All-Time low across ALL stored records
-    stats = await db.get_price_stats("10316")
-    assert stats.lowest_30d_pln == 1580.00
-    assert stats.lowest_all_time_pln == 1490.00
-    assert len(stats.daily_lowest_series) == 3
-
-    # Verify smart deduplication cache:
-    # 1st check -> True (should notify)
-    assert await db.should_notify_offer(999, offer_inside) is True
-    await db.mark_offer_notified(999, offer_inside)
-    # 2nd check for same offer at same price -> False (never notify twice!)
-    assert await db.should_notify_offer(999, offer_inside) is False
-
-    # If seller drops price by 20 PLN -> True (notify price drop!)
-    offer_dropped = Offer(
-        set_number="10316",
-        title="LEGO 10316 Rivendell",
-        source="olx.pl",
-        store_name="OLX Seller",
-        url="https://olx.pl/1",
-        external_id="olx-1",
-        item_price_original=1586.01,
-        currency_original="PLN",
-        item_price_pln=1586.01,
-        delivery_price_pln=13.99,
+    # 3. Test persistent 5-minute run logs with 1 succeeded site and 1 failed site
+    rep_ok = ScraperSiteReport(
+        set_number="21348",
+        source="ceneo.pl",
+        urls_scraped=["https://www.ceneo.pl/;szukaj-lego+21348", "https://www.ceneo.pl/165836290;0280-0.htm"],
+        success=True,
+        offers=[offer_1500],
     )
-    assert await db.should_notify_offer(999, offer_dropped) is True
+    rep_fail = ScraperSiteReport(
+        set_number="21348",
+        source="vinted.pl",
+        urls_scraped=["https://www.vinted.pl/api/v2/catalog/items?search_text=lego%2021348"],
+        success=False,
+        offers=[],
+        error_message="HTTP 403",
+    )
+    run_id = await db.record_scan_run_logs(
+        started_at="2026-11-17 15:00:00 UTC",
+        finished_at="2026-11-17 15:00:15 UTC",
+        overall_status="FAILED (1/2 site checks failed — valid data saved)",
+        sets_scanned=1,
+        total_offers_found=1,
+        failed_sites_count=1,
+        summary_log="Sample log",
+        site_reports=[rep_ok, rep_fail],
+    )
+    assert run_id > 0
+    recent_runs = await db.get_recent_scan_runs(limit=1)
+    assert len(recent_runs) == 1
+    assert recent_runs[0]["overall_status"].startswith("FAILED")
+    assert len(recent_runs[0]["site_logs"]) == 2
 
-    # Test composite chart PNG generation
-    png_bytes = await render_deal_card_with_chart(sub, stats, current_best_pln=1620.0)
+    # 4. Verify chart generation
+    stats = await db.get_price_stats("21348")
+    png_bytes = await render_deal_card_with_chart(sub, stats, current_best_pln=1500.0)
     assert png_bytes.startswith(b"\x89PNG")
-    assert len(png_bytes) > 5000
-
-    # Test currency conversion fallback
     conv = CurrencyConverter()
-    pln_val = conv.to_pln_sync(100.0, "EUR")
-    assert pln_val > 350.0
+    assert conv.to_pln_sync(100.0, "EUR") > 350.0

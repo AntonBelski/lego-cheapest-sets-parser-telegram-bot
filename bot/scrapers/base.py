@@ -4,7 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from bot.models import Offer, SetMetadata
+from bot.models import Offer, ScraperSiteReport, SetMetadata
 
 
 def parse_price_number(raw: str) -> Optional[float]:
@@ -40,19 +40,82 @@ def detect_currency(raw: str, default: str = "PLN") -> str:
     return default
 
 
+def deduplicate_offers(offers: list[Offer]) -> list[Offer]:
+    """Deduplicate offers from the same scraper (e.g. when fetching both newest & lowest sort)."""
+    by_key: dict[tuple[str, str], Offer] = {}
+    for off in offers:
+        k = (off.source, off.external_id)
+        if k not in by_key or off.total_price_pln < by_key[k].total_price_pln:
+            by_key[k] = off
+    return list(by_key.values())
+
+
 class BaseScraper(ABC):
     """Base class for all marketplace and aggregator scrapers."""
 
     source_name: str = "unknown"
+
+    def __init__(self) -> None:
+        self.last_urls_scraped: list[str] = []
+        self.last_error: Optional[str] = None
+
+    def _reset_run_trace(self) -> None:
+        self.last_urls_scraped = []
+        self.last_error = None
+
+    def _record_url(self, url: str) -> None:
+        if url and url not in self.last_urls_scraped:
+            self.last_urls_scraped.append(url)
+
+    def _record_failure(self, msg: str) -> None:
+        if not self.last_error:
+            self.last_error = msg
+        else:
+            self.last_error = f"{self.last_error}; {msg}"
 
     @abstractmethod
     async def fetch_offers(
         self,
         set_number: str,
         msrp_pln: Optional[float] = None,
+        full_scan: bool = False,
     ) -> list[Offer]:
         """Fetch valid new / open-box-sealed-bags original LEGO offers for `set_number`."""
         raise NotImplementedError
+
+    async def scrape_with_report(
+        self,
+        set_number: str,
+        msrp_pln: Optional[float] = None,
+        full_scan: bool = False,
+    ) -> ScraperSiteReport:
+        """Execute `fetch_offers` and return a structured `ScraperSiteReport` with all scraped URLs."""
+        self._reset_run_trace()
+        try:
+            offers = await self.fetch_offers(
+                set_number=set_number,
+                msrp_pln=msrp_pln,
+                full_scan=full_scan,
+            )
+            deduped = deduplicate_offers(offers)
+            success = self.last_error is None
+            return ScraperSiteReport(
+                set_number=set_number,
+                source=self.source_name,
+                urls_scraped=list(self.last_urls_scraped),
+                success=success,
+                offers=deduped,
+                error_message=self.last_error,
+            )
+        except Exception as exc:
+            return ScraperSiteReport(
+                set_number=set_number,
+                source=self.source_name,
+                urls_scraped=list(self.last_urls_scraped),
+                success=False,
+                offers=[],
+                error_message=str(exc)[:250],
+            )
 
     async def fetch_metadata(self, set_number: str) -> Optional[SetMetadata]:
         """Optionally fetch set metadata (name, MSRP on lego.pl, image, retirement date)."""

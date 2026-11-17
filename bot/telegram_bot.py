@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 from typing import Optional
 
@@ -19,6 +20,7 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.db import Database
+from bot.models import format_retirement_status_and_countdown
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import currency_converter
 from bot.services.http_client import http_client
@@ -34,12 +36,6 @@ class SubscriptionForm(StatesGroup):
 
 
 def parse_optional_bound(raw: str, is_min: bool) -> Optional[float]:
-    """
-    Parse user input for price_from or price_to.
-    If skipped ('-', 'skip', 'none', 'inf', 'infinity', '0' for min), returns:
-    - 0.0 for price_from
-    - None (infinity) for price_to
-    """
     cleaned = (raw or "").strip().lower().replace("pln", "").replace("zł", "").strip()
     if cleaned in ("", "-", "skip", "none", "null", "inf", "infinity", "∞", "pomiń"):
         return 0.0 if is_min else None
@@ -62,6 +58,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="📡 Scraper & FX Status", callback_data="menu:status"),
+                InlineKeyboardButton(text="📜 Run Logs (DB)", callback_data="menu:logs"),
             ],
         ]
     )
@@ -76,7 +73,7 @@ def set_actions_keyboard(set_number: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text=f"🛒 Top Deals", callback_data=f"set:deals:{set_number}"),
             ],
             [
-                InlineKeyboardButton(text=f"✏️ Edit Price Range", callback_data=f"set:edit:{set_number}"),
+                InlineKeyboardButton(text="✏️ Edit Price Range", callback_data=f"set:edit:{set_number}"),
                 InlineKeyboardButton(text=f"🗑 Remove {set_number}", callback_data=f"set:remove:{set_number}"),
             ],
         ]
@@ -106,19 +103,20 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             "and track set <b>retirement dates</b> every 5 days.\n\n"
             "<b>Monitored Sites:</b>\n"
             "• <code>olx.pl</code>, <code>vinted.pl</code>, <code>allegrolokalnie.pl</code>, <code>allegro.pl</code>\n"
-            "• <code>promoklocki.pl</code>, <code>klocki.app</code>, <code>ceneo.pl</code>\n"
-            "• <code>brickmerge.de</code> (Amazon DE/FR/ES/IT & EU stores), <code>ebay.pl</code>, <code>bricklink.com</code>\n"
+            "• <code>promoklocki.pl</code>, <code>zklockow.pl</code>, <code>ceneo.pl</code>\n"
+            "• <code>brickmerge.de</code> (only EU stores shipping to PL), <code>ebay.pl</code>, <code>bricklink.com</code>\n"
             "• <code>smyk.com</code>, <code>empik.com</code>, <code>mediaexpert.pl</code>\n\n"
             "<b>Commands:</b>\n"
             "• /add — Add a set interactively (with <b>Skip</b> for 0 or ∞)\n"
-            "• <code>/add 10316 - 1750</code> — Quick add (Price From = 0 PLN, Price To = 1750 PLN)\n"
+            "• <code>/add 21348 - 1500</code> — Quick add (Price From = 0 PLN, Price To = 1500 PLN)\n"
             "• /list — View & manage your subscribed sets\n"
-            "• <code>/deals 10316</code> — Show cheapest current offers across all sites\n"
-            "• <code>/chart 10316</code> — View set image + daily lowest price chart\n"
+            "• <code>/deals 21348</code> — Show cheapest current offers across all sites\n"
+            "• <code>/chart 21348</code> — View set image + daily lowest price chart\n"
             "• <code>/check [set]</code> — Force an immediate scan\n"
             "• /retire — Check retirement dates & countdowns\n"
+            "• /logs — View latest 5-min run logs & scraped URLs stored in DB\n"
             "• /status — View scraper health & NBP FX rates\n"
-            "• <code>/remove 10316</code> — Unsubscribe from a set"
+            "• <code>/remove 21348</code> — Unsubscribe from a set"
         )
         await message.answer(text, parse_mode="HTML", reply_markup=main_menu_keyboard())
 
@@ -132,17 +130,16 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
 
         args = (command.args or "").strip().split()
         if args:
-            # Quick syntax: /add <set_number> [price_from|-] [price_to|-]
             set_number = args[0].strip()
             if not set_number.isdigit():
-                await message.answer("❌ Set number must be digits (e.g. <code>10316</code>).", parse_mode="HTML")
+                await message.answer("❌ Set number must be digits (e.g. <code>21348</code>).", parse_mode="HTML")
                 return
             try:
                 p_from = parse_optional_bound(args[1], is_min=True) if len(args) >= 2 else 0.0
                 p_to = parse_optional_bound(args[2], is_min=False) if len(args) >= 3 else None
             except ValueError:
                 await message.answer(
-                    "❌ Invalid price format. Example: <code>/add 10316 - 1750</code> or <code>/add 10316 1200 1750</code>",
+                    "❌ Invalid price format. Example: <code>/add 21348 - 1500</code> or <code>/add 21348 1100 1500</code>",
                     parse_mode="HTML",
                 )
                 return
@@ -150,10 +147,9 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             await _finalize_subscription(message, message.chat.id, set_number, p_from or 0.0, p_to)
             return
 
-        # Start interactive wizard
         await state.set_state(SubscriptionForm.waiting_for_set_number)
         await message.answer(
-            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>10316</code> or <code>75192</code>):",
+            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>21348</code> or <code>10316</code>):",
             parse_mode="HTML",
         )
 
@@ -164,11 +160,11 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await callback.answer()
         await state.set_state(SubscriptionForm.waiting_for_set_number)
         await callback.message.answer(
-            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>10316</code>):",
+            "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>21348</code>):",
             parse_mode="HTML",
         )
 
-    @router. callback_query(F.data.startswith("set:edit:"))
+    @router.callback_query(F.data.startswith("set:edit:"))
     async def cb_edit_set(callback: CallbackQuery, state: FSMContext) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
@@ -192,7 +188,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def process_set_number(message: Message, state: FSMContext) -> None:
         raw = (message.text or "").strip()
         if not raw.isdigit():
-            await message.answer("❌ Please enter a numeric LEGO set number (e.g. <code>10316</code>):", parse_mode="HTML")
+            await message.answer("❌ Please enter a numeric LEGO set number (e.g. <code>21348</code>):", parse_mode="HTML")
             return
         await state.update_data(set_number=raw)
         await state.set_state(SubscriptionForm.waiting_for_price_from)
@@ -221,7 +217,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             ]
         )
         await callback.message.answer(
-            "💰 <b>Step 3/3:</b> Enter maximum price <b>Price To (PLN)</b> (e.g. <code>1750</code>), "
+            "💰 <b>Step 3/3:</b> Enter maximum price <b>Price To (PLN)</b> (e.g. <code>1500</code>), "
             "or press <b>Skip (∞ Infinity)</b>:",
             parse_mode="HTML",
             reply_markup=kb,
@@ -292,7 +288,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         status_msg = await msg.answer(
             f"⏳ Subscribed to <b>LEGO {html.escape(set_number)}</b> "
             f"(Range: <b>{html.escape(sub.formatted_range)}</b>).\n"
-            f"Fetching LEGO.pl MSRP, historical prices, and scanning stores...",
+            f"Fetching LEGO.pl MSRP, retirement date, and historical prices...",
             parse_mode="HTML",
         )
         meta = await monitor.enrich_set_on_subscribe(set_number)
@@ -302,6 +298,9 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         msrp_str = f"{updated_sub.msrp_pln:.2f} PLN" if updated_sub.msrp_pln else "Fetching on next scan"
         low30_str = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "Scanning..."
         lowall_str = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "Scanning..."
+        ret_str = format_retirement_status_and_countdown(
+            updated_sub.retirement_date, updated_sub.retirement_source
+        )
 
         await status_msg.edit_text(
             f"✅ <b>Subscription Active: LEGO {html.escape(set_number)}</b>\n"
@@ -309,8 +308,9 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             f"🎯 <b>Your Price Range:</b> <b>{html.escape(updated_sub.formatted_range)}</b>\n"
             f"🏷 <b>LEGO.pl MSRP:</b> {msrp_str}\n"
             f"📉 <b>Lowest (30d):</b> {low30_str}\n"
-            f"🏆 <b>Lowest (All-Time):</b> {lowall_str}\n\n"
-            f"<i>I will check all 13 sites every 5 minutes and notify you with the set photo & daily price chart whenever a new offer appears in your range!</i>",
+            f"🏆 <b>Lowest (All-Time):</b> {lowall_str}\n"
+            f"⏳ <b>Retirement Status:</b> {html.escape(ret_str)}\n\n"
+            f"<i>First scan will perform a deep multi-page scan across all 13 sites, and then check every 5 minutes for new offers & price drops!</i>",
             parse_mode="HTML",
             reply_markup=set_actions_keyboard(set_number),
         )
@@ -336,7 +336,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         if not subs:
             await msg.answer(
                 "📭 You don't have any active LEGO set subscriptions yet.\n"
-                "Click <b>➕ Add LEGO Set</b> or use <code>/add 10316 - 1750</code>.",
+                "Click <b>➕ Add LEGO Set</b> or use <code>/add 21348 - 1500</code>.",
                 parse_mode="HTML",
                 reply_markup=main_menu_keyboard(),
             )
@@ -351,7 +351,9 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             msrp_txt = f"{sub.msrp_pln:.2f} PLN" if sub.msrp_pln else "N/A"
             low30_txt = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "N/A"
             lowall_txt = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "N/A"
-            ret_txt = f"{sub.retirement_date} ({sub.retirement_source})" if sub.retirement_date else "Not announced yet"
+            ret_txt = format_retirement_status_and_countdown(
+                sub.retirement_date, sub.retirement_source
+            )
 
             card_text = (
                 f"🧱 <b>LEGO {html.escape(sub.set_number)} — {html.escape(sub.set_name or 'LEGO Set')}</b>\n"
@@ -359,7 +361,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
                 f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_txt}\n"
                 f"📉 <b>Lowest (Last 30 Days):</b> {low30_txt}\n"
                 f"🏆 <b>Lowest (All Time):</b> {lowall_txt}\n"
-                f"⏳ <b>Retirement Date:</b> {html.escape(ret_txt)}"
+                f"⏳ <b>Retirement Status:</b> {html.escape(ret_txt)}"
             )
             await msg.answer(
                 card_text,
@@ -376,7 +378,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return
         set_number = (command.args or "").strip()
         if not set_number:
-            await message.answer("Usage: <code>/remove 10316</code>", parse_mode="HTML")
+            await message.answer("Usage: <code>/remove 21348</code>", parse_mode="HTML")
             return
         removed = await db.remove_subscription(message.chat.id, set_number)
         if removed:
@@ -397,7 +399,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         )
 
     # -------------------------------------------------------------------------
-    # /chart Command & Callback (Set Image + Daily Lowest Price Dynamics)
+    # /chart Command & Callback
     # -------------------------------------------------------------------------
     @router.message(Command("chart"))
     async def cmd_chart(message: Message, command: CommandObject) -> None:
@@ -405,7 +407,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return
         set_number = (command.args or "").strip()
         if not set_number:
-            await message.answer("Usage: <code>/chart 10316</code>", parse_mode="HTML")
+            await message.answer("Usage: <code>/chart 21348</code>", parse_mode="HTML")
             return
         await _send_chart_for_set(message, message.chat.id, set_number)
 
@@ -431,18 +433,22 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         png_bytes = await render_deal_card_with_chart(sub, stats, current_best_pln=curr_best)
         photo = BufferedInputFile(png_bytes, filename=f"lego_{set_number}_chart.png")
 
+        ret_str = format_retirement_status_and_countdown(
+            sub.retirement_date, sub.retirement_source
+        )
         caption = (
             f"📈 <b>Daily Lowest Price Dynamics: LEGO {html.escape(set_number)}</b>\n"
             f"🧱 <b>{html.escape(sub.set_name or '')}</b>\n"
             f"🏷 <b>LEGO.pl MSRP:</b> {f'{sub.msrp_pln:.2f} PLN' if sub.msrp_pln else 'N/A'}\n"
             f"📉 <b>Lowest (Last 30 Days):</b> {f'{stats.lowest_30d_pln:.2f} PLN ({stats.lowest_30d_source})' if stats.lowest_30d_pln else 'N/A'}\n"
             f"🏆 <b>Lowest (All Time):</b> {f'{stats.lowest_all_time_pln:.2f} PLN ({stats.lowest_all_time_source})' if stats.lowest_all_time_pln else 'N/A'}\n"
+            f"⏳ <b>Retirement Status:</b> {html.escape(ret_str)}\n"
             f"🎯 <b>Your Range:</b> {html.escape(sub.formatted_range)}"
         )
         await msg.answer_photo(photo=photo, caption=caption, parse_mode="HTML")
 
     # -------------------------------------------------------------------------
-    # /deals Command & Callback (Show Top Cheapest Offers Across All Sites)
+    # /deals Command & Callback
     # -------------------------------------------------------------------------
     @router.message(Command("deals"))
     async def cmd_deals(message: Message, command: CommandObject) -> None:
@@ -450,7 +456,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return
         set_number = (command.args or "").strip()
         if not set_number:
-            await message.answer("Usage: <code>/deals 10316</code>", parse_mode="HTML")
+            await message.answer("Usage: <code>/deals 21348</code>", parse_mode="HTML")
             return
         await _send_top_deals(message, set_number)
 
@@ -483,6 +489,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         ]
         for idx, r in enumerate(rows, start=1):
             total_p = float(r["total_price_pln"])
+            prev_p = r.get("previous_price_pln")
             deliv_known = bool(r["delivery_known"])
             deliv_p = r["delivery_price_pln"]
             if not deliv_known or deliv_p is None:
@@ -492,6 +499,9 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             else:
                 p_str = f"{total_p:.2f} PLN (incl. {float(deliv_p):.2f} delivery)"
 
+            if prev_p is not None and abs(float(prev_p) - total_p) >= 1.0:
+                p_str = f"<s>{float(prev_p):.2f} PLN</s> ➔ {p_str}"
+
             lines.append(
                 f"{idx}. <a href=\"{html.escape(str(r['url']))}\"><b>{html.escape(str(r['store_name']))}</b></a> — "
                 f"<b>{p_str}</b> [<i>{html.escape(str(r['condition']))}</i>]"
@@ -500,7 +510,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await msg.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
     # -------------------------------------------------------------------------
-    # /check Command & Callbacks (Immediate Scan)
+    # /check Command & Callbacks
     # -------------------------------------------------------------------------
     @router.message(Command("check"))
     async def cmd_check(message: Message, command: CommandObject) -> None:
@@ -558,7 +568,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         )
 
     # -------------------------------------------------------------------------
-    # /retire Command & Callback (Retirement Dates)
+    # /retire Command & Callback
     # -------------------------------------------------------------------------
     @router.message(Command("retire"))
     async def cmd_retire(message: Message) -> None:
@@ -590,7 +600,52 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         )
 
     # -------------------------------------------------------------------------
-    # /status Command & Callback (Scraper Health + NBP FX Rates + Call Math)
+    # /logs Command & Callback (Persistent 5-min Run Logs from DB)
+    # -------------------------------------------------------------------------
+    @router.message(Command("logs"))
+    async def cmd_logs(message: Message) -> None:
+        if not message.chat or not _is_authorized(message.chat.id):
+            return
+        await _send_recent_logs(message)
+
+    @router.callback_query(F.data == "menu:logs")
+    async def cb_menu_logs(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await callback.answer()
+        await _send_recent_logs(callback.message)
+
+    async def _send_recent_logs(msg: Message) -> None:
+        runs = await db.get_recent_scan_runs(limit=1)
+        if not runs:
+            await msg.answer("📭 No 5-minute scan runs logged in the database yet. Run /check first.", parse_mode="HTML")
+            return
+
+        r = runs[0]
+        status_icon = "✅" if r["overall_status"] == "SUCCESS" else "❌"
+        lines = [
+            f"📜 <b>Latest 5-Minute Run Log (DB Run #{r['id']})</b>",
+            f"🕒 <b>Time:</b> {html.escape(str(r['started_at']))}",
+            f"{status_icon} <b>Overall Run Status:</b> <b>{html.escape(str(r['overall_status']))}</b>",
+            f"📦 <b>Sets Scanned:</b> {r['sets_scanned']} | <b>Offers Saved:</b> {r['total_offers_found']} | <b>Failed Sites:</b> {r['failed_sites_count']}",
+            "",
+        ]
+        for sl in r.get("site_logs", []):
+            s_icon = "✅" if sl["status"] == "SUCCESS" else "❌"
+            urls = json.loads(sl.get("urls_scraped_json") or "[]")
+            first_url = urls[0] if urls else "N/A"
+            extra_urls = f" (+{len(urls) - 1} more)" if len(urls) > 1 else ""
+            err_note = f" — <i>{html.escape(str(sl['error_message']))}</i>" if sl.get("error_message") else ""
+            lines.append(
+                f"{s_icon} <b>[{html.escape(str(sl['set_number']))}] {html.escape(str(sl['source']))}</b>: "
+                f"{sl['offers_found']} offers{err_note}\n"
+                f"   ↳ <code>{html.escape(first_url)}</code>{extra_urls}"
+            )
+
+        await msg.answer("\n".join(lines)[:4000], parse_mode="HTML", disable_web_page_preview=True)
+
+    # -------------------------------------------------------------------------
+    # /status Command & Callback
     # -------------------------------------------------------------------------
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
@@ -626,7 +681,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             lines.append("<i>No scan runs recorded yet. Run /check to test all sites.</i>")
         else:
             for r in health_rows:
-                icon = "✅" if r["last_status"] == "OK" else "⚠️"
+                icon = "✅" if r["last_status"] == "OK" else "❌"
                 lines.append(
                     f"{icon} <code>{html.escape(str(r['source']))}</code>: "
                     f"<b>{r['offers_count']} offers</b> ({r['last_run_at']})"

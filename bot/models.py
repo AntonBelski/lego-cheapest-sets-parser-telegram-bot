@@ -2,8 +2,60 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
+
+
+def format_retirement_status_and_countdown(
+    retirement_date_str: Optional[str],
+    retirement_source: Optional[str] = None,
+    today: Optional[date] = None,
+) -> str:
+    """
+    Format retirement status ('Retired: Yes/No') together with retirement date
+    and exact years / months / weeks / days remaining before retirement.
+    """
+    ref = today or datetime.now(timezone.utc).date()
+    if not retirement_date_str:
+        return "🟢 Active (Not retired | Retirement date not announced yet)"
+
+    try:
+        ret_date = date.fromisoformat(retirement_date_str[:10])
+    except ValueError:
+        return f"🟢 Active (Expected retirement: {retirement_date_str})"
+
+    total_days = (ret_date - ref).days
+    src_note = f" [source: {retirement_source}]" if retirement_source else ""
+
+    if total_days < 0:
+        return f"🔴 Retired: YES (Retired on {ret_date.isoformat()}, {abs(total_days)} days ago){src_note}"
+
+    if total_days == 0:
+        return f"⚠️ Retired: Retiring TODAY ({ret_date.isoformat()}){src_note}"
+
+    # Break down total_days into years, months, weeks, days
+    years = total_days // 365
+    rem = total_days % 365
+    months = rem // 30
+    rem = rem % 30
+    weeks = rem // 7
+    days = rem % 7
+
+    parts: list[str] = []
+    if years > 0:
+        parts.append(f"{years} year{'s' if years != 1 else ''}")
+    if months > 0:
+        parts.append(f"{months} month{'s' if months != 1 else ''}")
+    if weeks > 0:
+        parts.append(f"{weeks} week{'s' if weeks != 1 else ''}")
+    if days > 0 or not parts:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+
+    countdown_str = ", ".join(parts)
+    return (
+        f"🟢 Retired: NO — Retires on {ret_date.isoformat()} "
+        f"(in {countdown_str} | {total_days} days left){src_note}"
+    )
 
 
 @dataclass
@@ -37,7 +89,8 @@ class Offer:
     delivery_time: Optional[str] = None
     condition: str = "New (Sealed)"  # "New (Sealed)" or "New (Open Box, Sealed Bags)"
     image_url: Optional[str] = None
-    found_at: datetime = field(default_factory=datetime.utcnow)
+    previous_price_pln: Optional[float] = None  # Populated when a listing's price changed
+    found_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     @property
     def delivery_known(self) -> bool:
@@ -52,13 +105,20 @@ class Offer:
     def formatted_price(self) -> str:
         """Human-friendly final price with delivery status as requested."""
         if self.delivery_price_pln is None:
-            return f"{self.total_price_pln:.2f} PLN (+delivery)"
-        if self.delivery_price_pln == 0:
-            return f"{self.total_price_pln:.2f} PLN (free delivery)"
-        return (
-            f"{self.total_price_pln:.2f} PLN "
-            f"({self.item_price_pln:.2f} + {self.delivery_price_pln:.2f} delivery)"
-        )
+            base = f"{self.total_price_pln:.2f} PLN (+delivery)"
+        elif self.delivery_price_pln == 0:
+            base = f"{self.total_price_pln:.2f} PLN (free delivery)"
+        else:
+            base = (
+                f"{self.total_price_pln:.2f} PLN "
+                f"({self.item_price_pln:.2f} + {self.delivery_price_pln:.2f} delivery)"
+            )
+        if (
+            self.previous_price_pln is not None
+            and abs(self.previous_price_pln - self.total_price_pln) >= 1.0
+        ):
+            return f"{self.previous_price_pln:.2f} PLN ➔ {base}"
+        return base
 
     @property
     def offer_fingerprint(self) -> str:
@@ -70,6 +130,18 @@ class Offer:
         price_bucket = int(round(self.total_price_pln))
         raw = f"{self.source.lower()}|{self.set_number}|{self.external_id}|{price_bucket}"
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+@dataclass
+class ScraperSiteReport:
+    """Detailed execution report for a single scraper on a single set during a 5-min run."""
+
+    set_number: str
+    source: str
+    urls_scraped: list[str] = field(default_factory=list)
+    success: bool = True
+    offers: list[Offer] = field(default_factory=list)
+    error_message: Optional[str] = None
 
 
 @dataclass
@@ -86,6 +158,7 @@ class Subscription:
     image_url: Optional[str] = None
     retirement_date: Optional[str] = None  # YYYY-MM-DD
     retirement_source: Optional[str] = None
+    initial_scan_done: bool = False
     created_at: Optional[str] = None
 
     def matches_price(self, total_price_pln: float) -> bool:

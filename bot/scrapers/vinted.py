@@ -6,7 +6,11 @@ from typing import Optional
 from bot.models import Offer
 from bot.scrapers.base import BaseScraper
 from bot.services.currency import currency_converter
-from bot.services.filter import classify_condition, is_authentic_and_complete_set
+from bot.services.filter import (
+    classify_condition,
+    contains_set_number,
+    is_authentic_and_complete_set,
+)
 from bot.services.http_client import HAS_CURL_CFFI, http_client
 
 logger = logging.getLogger(__name__)
@@ -15,10 +19,11 @@ logger = logging.getLogger(__name__)
 class VintedScraper(BaseScraper):
     """
     Parser for vinted.pl using Vinted's v2 catalog JSON endpoint.
-    Automatically warms up a session cookie on vinted.pl and queries:
-      status_ids[]=6 (New with tags / Sealed)
-      status_ids[]=1 (New without tags / Open box with sealed bags)
-    Converts all prices (PLN/EUR/CZK/RON) to PLN.
+    - On first scan (`full_scan=True`): Paginates `page=1..3` (`per_page=40`)
+      plus `order=newest_first`.
+    - On every 5-minute scan (`full_scan=False`): Checks BOTH `order=newest_first`
+      AND `order=price_low_to_high` so both brand-new items and price reductions
+      on existing items are captured immediately.
     """
 
     source_name = "vinted.pl"
@@ -27,94 +32,125 @@ class VintedScraper(BaseScraper):
         self,
         set_number: str,
         msrp_pln: Optional[float] = None,
+        full_scan: bool = False,
     ) -> list[Offer]:
-        search_url = (
-            f"https://www.vinted.pl/api/v2/catalog/items"
-            f"?page=1&per_page=25&search_text=lego%20{set_number}"
-            f"&status_ids[]=6&status_ids[]=1&order=price_low_to_high"
-        )
-
-        items = await self._fetch_vinted_items(search_url)
-        if not items:
-            return []
+        urls_to_fetch: list[str] = []
+        if full_scan:
+            for page in (1, 2, 3):
+                urls_to_fetch.append(
+                    f"https://www.vinted.pl/api/v2/catalog/items"
+                    f"?page={page}&per_page=40&search_text=lego%20{set_number}"
+                    f"&status_ids[]=6&status_ids[]=1&order=price_low_to_high"
+                )
+            urls_to_fetch.append(
+                f"https://www.vinted.pl/api/v2/catalog/items"
+                f"?page=1&per_page=40&search_text=lego%20{set_number}"
+                f"&status_ids[]=6&status_ids[]=1&order=newest_first"
+            )
+        else:
+            urls_to_fetch = [
+                f"https://www.vinted.pl/api/v2/catalog/items"
+                f"?page=1&per_page=40&search_text=lego%20{set_number}"
+                f"&status_ids[]=6&status_ids[]=1&order=newest_first",
+                f"https://www.vinted.pl/api/v2/catalog/items"
+                f"?page=1&per_page=40&search_text=lego%20{set_number}"
+                f"&status_ids[]=6&status_ids[]=1&order=price_low_to_high",
+            ]
 
         offers: list[Offer] = []
-        for item in items:
-            if not isinstance(item, dict):
+        any_success = False
+
+        for search_url in urls_to_fetch:
+            self._record_url(search_url)
+            ok, items = await self._fetch_vinted_items(search_url)
+            if not ok:
+                self._record_failure(f"Failed fetching {search_url}")
                 continue
+            any_success = True
 
-            ext_id = str(item.get("id", ""))
-            title = str(item.get("title", "")).strip()
-            url = str(item.get("url", "")).strip()
-            if not url.startswith("http"):
-                url = f"https://www.vinted.pl{url}"
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
 
-            # Vinted v2 price structure can be a dict {"amount": "350.0", "currency_code": "PLN"} or string
-            raw_price = item.get("total_item_price") or item.get("price")
-            currency = str(item.get("currency", "PLN") or "PLN")
-            price_val: Optional[float] = None
+                ext_id = str(item.get("id", ""))
+                title = str(item.get("title", "")).strip()
+                url = str(item.get("url", "")).strip()
+                if not url.startswith("http"):
+                    url = f"https://www.vinted.pl{url}"
 
-            if isinstance(raw_price, dict):
-                try:
-                    price_val = float(raw_price.get("amount", 0))
-                    currency = str(raw_price.get("currency_code", currency))
-                except (TypeError, ValueError):
-                    price_val = None
-            elif raw_price is not None:
-                try:
-                    price_val = float(str(raw_price).replace(",", "."))
-                except ValueError:
-                    price_val = None
+                if not contains_set_number(title, set_number):
+                    continue
 
-            if not price_val or price_val <= 0:
-                continue
+                raw_price = item.get("total_item_price") or item.get("price")
+                currency = str(item.get("currency", "PLN") or "PLN")
+                price_val: Optional[float] = None
 
-            item_price_pln = await currency_converter.to_pln(price_val, currency)
+                if isinstance(raw_price, dict):
+                    try:
+                        price_val = float(raw_price.get("amount", 0))
+                        currency = str(raw_price.get("currency_code", currency))
+                    except (TypeError, ValueError):
+                        price_val = None
+                elif raw_price is not None:
+                    try:
+                        price_val = float(str(raw_price).replace(",", "."))
+                    except ValueError:
+                        price_val = None
 
-            brand_title = str(item.get("brand_title", "")).strip()
-            status_label = str(item.get("status", "")).strip()
+                if not price_val or price_val <= 0:
+                    continue
 
-            if not is_authentic_and_complete_set(
-                title=f"{brand_title} {title}",
-                set_number=set_number,
-                msrp_pln=msrp_pln,
-                item_price_pln=item_price_pln,
-            ):
-                continue
+                item_price_pln = await currency_converter.to_pln(price_val, currency)
 
-            cond = classify_condition(
-                title=title,
-                raw_condition=status_label,
-            )
-            if not cond:
-                continue
+                brand_title = str(item.get("brand_title", "")).strip()
+                status_label = str(item.get("status", "")).strip()
 
-            # Vinted shipping varies by seller country (PL/LT/CZ/SK/RO) and parcel size (~9.99 - 16.99 PLN)
-            # Since Vinted calculates exact shipping at checkout, we mark delivery_price_pln=None -> "(+delivery)"
-            photo = item.get("photo", {})
-            img_url = str(photo.get("url", "")) if isinstance(photo, dict) else None
-
-            offers.append(
-                Offer(
+                if not is_authentic_and_complete_set(
+                    title=f"{brand_title} {title}",
                     set_number=set_number,
-                    title=title,
-                    source=self.source_name,
-                    store_name="Vinted.pl Seller",
-                    url=url,
-                    external_id=ext_id or url[-20:],
-                    item_price_original=price_val,
-                    currency_original=currency,
+                    msrp_pln=msrp_pln,
                     item_price_pln=item_price_pln,
-                    delivery_price_pln=None,
-                    delivery_time="InPost / Orlen Paczka (2-4 dni)",
-                    condition=cond,
-                    image_url=img_url,
-                )
-            )
+                ):
+                    continue
 
+                cond = classify_condition(
+                    title=title,
+                    raw_condition=status_label,
+                )
+                if not cond:
+                    continue
+
+                photo = item.get("photo", {})
+                img_url = (
+                    str(photo.get("url", "")) if isinstance(photo, dict) else None
+                )
+
+                offers.append(
+                    Offer(
+                        set_number=set_number,
+                        title=title,
+                        source=self.source_name,
+                        store_name="Vinted.pl Seller",
+                        url=url,
+                        external_id=ext_id or url[-20:],
+                        item_price_original=price_val,
+                        currency_original=currency,
+                        item_price_pln=item_price_pln,
+                        delivery_price_pln=None,
+                        delivery_time="InPost / Orlen Paczka (2-4 dni)",
+                        condition=cond,
+                        image_url=img_url,
+                    )
+                )
+
+            if full_scan and len(items) < 35:
+                break
+
+        if any_success:
+            self.last_error = None
         return offers
 
-    async def _fetch_vinted_items(self, api_url: str) -> list[dict]:
+    async def _fetch_vinted_items(self, api_url: str) -> tuple[bool, list[dict]]:
         """Acquire Vinted session cookie and query the JSON catalog endpoint."""
         if HAS_CURL_CFFI:
             from curl_cffi.requests import AsyncSession
@@ -131,11 +167,12 @@ class VintedScraper(BaseScraper):
                     )
                     if resp.status_code == 200:
                         data = resp.json()
-                        return data.get("items", []) if isinstance(data, dict) else []
+                        items = data.get("items", []) if isinstance(data, dict) else []
+                        return True, items
             except Exception as exc:
                 logger.debug("Vinted session fetch failed: %s", exc)
 
         status, payload = await http_client.get_json(api_url)
         if status == 200 and isinstance(payload, dict):
-            return payload.get("items", [])
-        return []
+            return True, payload.get("items", [])
+        return False, []

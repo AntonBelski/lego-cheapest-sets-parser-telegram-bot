@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import re
 from datetime import date
@@ -9,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from bot.models import Offer, SetMetadata
 from bot.scrapers.base import BaseScraper, parse_price_number
-from bot.services.filter import is_authentic_and_complete_set
+from bot.services.filter import contains_set_number, is_authentic_and_complete_set
 from bot.services.http_client import http_client
 
 logger = logging.getLogger(__name__)
@@ -26,17 +25,14 @@ class PromoklockiScraper(BaseScraper):
 
     source_name = "promoklocki.pl"
 
-    async def fetch_page(self, set_number: str) -> tuple[int, str]:
-        url = f"https://promoklocki.pl/{set_number}"
-        status, html, _ = await http_client.get_text(url)
-        return status, html
-
     async def fetch_metadata_and_history(
         self, set_number: str
     ) -> tuple[Optional[SetMetadata], list[Offer], list[tuple[str, float, str]]]:
         url = f"https://promoklocki.pl/{set_number}"
+        self._record_url(url)
         status, html, _ = await http_client.get_text(url)
         if status != 200 or not html:
+            self._record_failure(f"HTTP {status} on {url}")
             return None, [], []
 
         soup = BeautifulSoup(html, "lxml")
@@ -46,17 +42,29 @@ class PromoklockiScraper(BaseScraper):
         h1 = soup.find("h1")
         if h1:
             raw_title = h1.get_text(" ", strip=True)
-            meta.name = re.sub(rf"^LEGO\s*®?\s*{re.escape(set_number)}\s*[-–:]?\s*", "", raw_title, flags=re.I).strip() or raw_title
+            meta.name = (
+                re.sub(
+                    rf"^LEGO\s*®?\s*{re.escape(set_number)}\s*[-–:]?\s*",
+                    "",
+                    raw_title,
+                    flags=re.I,
+                ).strip()
+                or raw_title
+            )
 
         # 2. Extract Image URL
         og_img = soup.find("meta", property="og:image")
         if og_img and og_img.get("content"):
             meta.image_url = str(og_img["content"]).strip()
         if not meta.image_url:
-            img_tag = soup.select_one("img.img-fluid, .product-image img, img[alt*='LEGO']")
+            img_tag = soup.select_one(
+                "img.img-fluid, .product-image img, img[alt*='LEGO']"
+            )
             if img_tag and img_tag.get("src"):
                 src = str(img_tag["src"])
-                meta.image_url = src if src.startswith("http") else f"https://promoklocki.pl{src}"
+                meta.image_url = (
+                    src if src.startswith("http") else f"https://promoklocki.pl{src}"
+                )
 
         # 3. Extract Official LEGO.pl Catalog Price (Cena katalogowa)
         page_text = soup.get_text(" ", strip=True)
@@ -84,7 +92,9 @@ class PromoklockiScraper(BaseScraper):
 
         # 5. Parse current active store offers from Promoklocki table/rows
         offers: list[Offer] = []
-        offer_rows = soup.select("table tr, .offer-row, .shop-offer, .row.align-items-center")
+        offer_rows = soup.select(
+            "table tr, .offer-row, .shop-offer, .row.align-items-center"
+        )
         for idx, row in enumerate(offer_rows):
             row_text = row.get_text(" ", strip=True)
             if "zł" not in row_text.lower():
@@ -96,19 +106,31 @@ class PromoklockiScraper(BaseScraper):
             href = str(link_el.get("href", "")).strip()
             if not href or href.startswith("#") or "javascript:" in href:
                 continue
-            full_url = href if href.startswith("http") else f"https://promoklocki.pl{href}"
+            # Skip internal links to OTHER sets on Promoklocki
+            if re.search(r"promoklocki\.pl/\d{4,6}", href) and not contains_set_number(
+                href, set_number
+            ):
+                continue
 
-            # Find price in PLN
-            price_matches = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I)
+            full_url = (
+                href if href.startswith("http") else f"https://promoklocki.pl{href}"
+            )
+
+            price_matches = re.findall(
+                r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I
+            )
             if not price_matches:
                 continue
             item_price = parse_price_number(price_matches[0])
             if not item_price:
                 continue
 
-            # Check if delivery cost is mentioned in the row
             delivery_price: Optional[float] = None
-            if re.search(r"darmowa\s+dostawa|wysyłka\s+0\s*z[łl]|dostawa\s+gratis", row_text, flags=re.I):
+            if re.search(
+                r"darmowa\s+dostawa|wysyłka\s+0\s*z[łl]|dostawa\s+gratis",
+                row_text,
+                flags=re.I,
+            ):
                 delivery_price = 0.0
             elif len(price_matches) >= 2 and "dostaw" in row_text.lower():
                 second_p = parse_price_number(price_matches[1])
@@ -126,9 +148,9 @@ class PromoklockiScraper(BaseScraper):
                 if len(txt) < 50 and "kup" not in txt.lower():
                     store_name = f"{txt} (Promoklocki)"
 
-            title = row_text[:140]
+            offer_title = f"LEGO {set_number} {meta.name or ''}".strip()
             if not is_authentic_and_complete_set(
-                title=f"LEGO {set_number} {title}",
+                title=f"{offer_title} {row_text[:120]}",
                 set_number=set_number,
                 msrp_pln=meta.msrp_pln,
                 item_price_pln=item_price,
@@ -139,7 +161,7 @@ class PromoklockiScraper(BaseScraper):
             offers.append(
                 Offer(
                     set_number=set_number,
-                    title=f"LEGO {set_number} {meta.name or ''}".strip(),
+                    title=offer_title,
                     source=self.source_name,
                     store_name=store_name,
                     url=full_url,
@@ -154,11 +176,10 @@ class PromoklockiScraper(BaseScraper):
                 )
             )
 
-        # 6. Extract historical lowest price points from embedded scripts or summary text
+        # 6. Extract historical lowest price points from embedded scripts
         history_points: list[tuple[str, float, str]] = []
         for script in soup.find_all("script"):
             stext = script.string or ""
-            # Look for date + price arrays often embedded in chart configurations
             pairs = re.findall(
                 r'["\'](20\d{2}-\d{2}-\d{2})["\']\s*[,:]\s*(\d+(?:\.\d{1,2})?)',
                 stext,
@@ -181,6 +202,7 @@ class PromoklockiScraper(BaseScraper):
         self,
         set_number: str,
         msrp_pln: Optional[float] = None,
+        full_scan: bool = False,
     ) -> list[Offer]:
         _, offers, _ = await self.fetch_metadata_and_history(set_number)
         return offers
