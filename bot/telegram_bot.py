@@ -42,7 +42,7 @@ async def safe_callback_answer(callback: CallbackQuery, text: Optional[str] = No
         if text:
             await callback.answer(text)
         else:
-            await safe_callback_answer(callback)
+            await callback.answer()
     except TelegramBadRequest as exc:
         logger.debug("Ignoring stale callback answer error: %s", exc)
     except Exception as exc:

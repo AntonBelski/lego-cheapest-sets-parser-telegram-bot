@@ -17,6 +17,7 @@ class Settings:
         default_factory=lambda: (
             int(os.getenv("TELEGRAM_CHAT_ID", "").strip())
             if os.getenv("TELEGRAM_CHAT_ID", "").strip().lstrip("-").isdigit()
+            and os.getenv("TELEGRAM_CHAT_ID", "").strip() != "123456789"
             else None
         )
     )
