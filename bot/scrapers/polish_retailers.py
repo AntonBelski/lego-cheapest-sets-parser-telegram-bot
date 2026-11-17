@@ -144,10 +144,43 @@ class _BasePolishRetailerScraper(BaseScraper):
                 continue
 
             text = card.get_text(" ", strip=True)
-            price_m = re.search(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", text, flags=re.I)
-            if not price_m:
-                continue
-            price_val = parse_price_number(price_m.group(1))
+            # Extract price from dedicated main price elements first (avoiding installment/delivery numbers like "15,90 zł x 110 rat")
+            price_val: Optional[float] = None
+            for p_sel in (
+                "[data-price]",
+                ".main-price",
+                ".price-box .price",
+                ".product-price",
+                ".price",
+            ):
+                p_el = card.select_one(p_sel)
+                if p_el:
+                    p_txt = str(p_el.get("data-price") or p_el.get_text(" ", strip=True))
+                    if any(bad in p_txt.lower() for bad in ("rat", "miesięcz", "mies.", "dostaw")):
+                        continue
+                    candidate = parse_price_number(p_txt)
+                    if candidate:
+                        price_val = candidate
+                        break
+
+            if price_val is None:
+                # Strip installment phrases like '15,90 zł x 60 rat' or 'rata od 15,90 zł' before regex matching
+                cleaned_text = re.sub(
+                    r"(?:rata(?:\s+od)?|raty(?:\s+od)?|\d+\s*x)\s*\d[\d\s]*[,.]\d{2}\s*z[łl]",
+                    " ",
+                    text,
+                    flags=re.I,
+                )
+                cleaned_text = re.sub(
+                    r"\d[\d\s]*[,.]\d{2}\s*z[łl]\s*(?:x\s*\d+|/\s*mies|miesięcz|rat)",
+                    " ",
+                    cleaned_text,
+                    flags=re.I,
+                )
+                price_m = re.search(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", cleaned_text, flags=re.I)
+                if not price_m:
+                    continue
+                price_val = parse_price_number(price_m.group(1))
             if not price_val:
                 continue
 

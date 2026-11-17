@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,6 +34,19 @@ class SubscriptionForm(StatesGroup):
     waiting_for_set_number = State()
     waiting_for_price_from = State()
     waiting_for_price_to = State()
+
+
+async def safe_callback_answer(callback: CallbackQuery, text: Optional[str] = None) -> None:
+    """Answer inline callback query without failing if the query is >60s old (e.g. GitHub Actions cron mode)."""
+    try:
+        if text:
+            await callback.answer(text)
+        else:
+            await safe_callback_answer(callback)
+    except TelegramBadRequest as exc:
+        logger.debug("Ignoring stale callback answer error: %s", exc)
+    except Exception as exc:
+        logger.debug("Callback answer failed: %s", exc)
 
 
 def parse_optional_bound(raw: str, is_min: bool) -> Optional[float]:
@@ -157,7 +171,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_menu_add(callback: CallbackQuery, state: FSMContext) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         await state.set_state(SubscriptionForm.waiting_for_set_number)
         await callback.message.answer(
             "🧱 <b>Step 1/3:</b> Send the <b>LEGO Set Number</b> you want to track (e.g. <code>21348</code>):",
@@ -168,7 +182,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_edit_set(callback: CallbackQuery, state: FSMContext) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         set_number = (callback.data or "").split(":")[-1]
         await state.update_data(set_number=set_number)
         await state.set_state(SubscriptionForm.waiting_for_price_from)
@@ -208,7 +222,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_skip_price_from(callback: CallbackQuery, state: FSMContext) -> None:
         if not callback.message:
             return
-        await callback.answer("Price From set to 0 PLN")
+        await safe_callback_answer(callback, "Price From set to 0 PLN")
         await state.update_data(price_from=0.0)
         await state.set_state(SubscriptionForm.waiting_for_price_to)
         kb = InlineKeyboardMarkup(
@@ -249,7 +263,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_skip_price_to(callback: CallbackQuery, state: FSMContext) -> None:
         if not callback.message:
             return
-        await callback.answer("Price To set to ∞ Infinity")
+        await safe_callback_answer(callback, "Price To set to ∞ Infinity")
         data = await state.get_data()
         await state.clear()
         set_number = data.get("set_number", "")
@@ -328,7 +342,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_menu_list(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         await _send_subscriptions_list(callback.message, callback.message.chat.id)
 
     async def _send_subscriptions_list(msg: Message, chat_id: int) -> None:
@@ -392,7 +406,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return
         set_number = (callback.data or "").split(":")[-1]
         await db.remove_subscription(callback.message.chat.id, set_number)
-        await callback.answer(f"Removed LEGO {set_number}")
+        await safe_callback_answer(callback, f"Removed LEGO {set_number}")
         await callback.message.edit_text(
             f"🗑 Unsubscribed from <b>LEGO {html.escape(set_number)}</b>.",
             parse_mode="HTML",
@@ -415,7 +429,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_chart_set(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer("Generating price chart...")
+        await safe_callback_answer(callback, "Generating price chart...")
         set_number = (callback.data or "").split(":")[-1]
         await _send_chart_for_set(callback.message, callback.message.chat.id, set_number)
 
@@ -464,7 +478,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_deals_set(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         set_number = (callback.data or "").split(":")[-1]
         await _send_top_deals(callback.message, set_number)
 
@@ -541,7 +555,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_check_all(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer("Starting scan...")
+        await safe_callback_answer(callback, "Starting scan...")
         wait = await callback.message.answer("🔄 Scanning all subscribed LEGO sets across all 13 sites...", parse_mode="HTML")
         res = await monitor.scan_all_subscribed_sets()
         total_found = sum(len(v) for v in res.values())
@@ -554,7 +568,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_check_single(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer("Scanning set...")
+        await safe_callback_answer(callback, "Scanning set...")
         set_number = (callback.data or "").split(":")[-1]
         wait = await callback.message.answer(f"🔍 Scanning 13 sites for <b>LEGO {html.escape(set_number)}</b>...", parse_mode="HTML")
         offers = await monitor.scan_single_set(set_number)
@@ -588,7 +602,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_menu_retire(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer("Checking retirement dates...")
+        await safe_callback_answer(callback, "Checking retirement dates...")
         wait = await callback.message.answer("⏳ Checking retirement dates on Brickset, BrickEconomy & Promoklocki...", parse_mode="HTML")
         summaries = await monitor.check_all_retirement_dates(force_report_chat_id=callback.message.chat.id)
         if not summaries:
@@ -612,7 +626,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_menu_logs(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         await _send_recent_logs(callback.message)
 
     async def _send_recent_logs(msg: Message) -> None:
@@ -642,7 +656,17 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
                 f"   ↳ <code>{html.escape(first_url)}</code>{extra_urls}"
             )
 
-        await msg.answer("\n".join(lines)[:4000], parse_mode="HTML", disable_web_page_preview=True)
+        # Fit safely within Telegram's 4096-char message limit without slicing HTML tags
+        output_lines: list[str] = []
+        total_len = 0
+        for line in lines:
+            if total_len + len(line) + 1 > 3900:
+                output_lines.append("<i>... (truncated; full log in GitHub Actions & db-state/data/scraper_runs.log)</i>")
+                break
+            output_lines.append(line)
+            total_len += len(line) + 1
+
+        await msg.answer("\n".join(output_lines), parse_mode="HTML", disable_web_page_preview=True)
 
     # -------------------------------------------------------------------------
     # /status Command & Callback
@@ -657,7 +681,7 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
     async def cb_menu_status(callback: CallbackQuery) -> None:
         if not callback.message or not _is_authorized(callback.message.chat.id):
             return
-        await callback.answer()
+        await safe_callback_answer(callback)
         await _send_status_report(callback.message)
 
     async def _send_status_report(msg: Message) -> None:

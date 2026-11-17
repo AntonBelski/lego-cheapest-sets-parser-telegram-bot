@@ -12,6 +12,7 @@ from bot.models import (
     format_retirement_status_and_countdown,
 )
 from bot.scrapers.brickmerge import check_brickmerge_shop_ships_to_poland
+from bot.scrapers.polish_retailers import MediaExpertScraper
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import CurrencyConverter
 from bot.services.filter import (
@@ -19,6 +20,7 @@ from bot.services.filter import (
     contains_set_number,
     is_authentic_and_complete_set,
 )
+from bot.services.monitor import LegoMonitorService
 from bot.services.retirement import match_retirement_milestone, parse_flexible_date
 from bot.telegram_bot import parse_optional_bound
 
@@ -68,6 +70,24 @@ def test_authenticity_and_condition_filtering() -> None:
     assert not is_authentic_and_complete_set(
         "Oświetlenie LED do LEGO 10316 Briksmax", set_number="10316"
     )
+    assert not is_authentic_and_complete_set(
+        "Klocki - Dungeons & Dragons: Opowieść Czerwonego Smoka - jak LEGO 21348",
+        set_number="21348",
+    )
+
+    # MediaExpert installment price guard ('15,90 zł x 110 rat' vs main '1736,40 zł')
+    fake_html = """
+    <html><body>
+      <div class="offer-box">
+        <a href="/zabawki/lego/lego-21348-ideas" title="LEGO 21348 Ideas">LEGO 21348 Ideas</a>
+        <span>rata 15,90 zł x 110 rat</span>
+        <span class="main-price">1 736,40 zł</span>
+      </div>
+    </body></html>
+    """
+    me_offers = MediaExpertScraper()._parse_retail_html(fake_html, "21348", msrp_pln=1549.99)
+    assert len(me_offers) == 1
+    assert me_offers[0].item_price_pln == 1736.40
 
     assert classify_condition("LEGO 10316 Nowy fabrycznie zamknięty MISB") == "New (Sealed)"
     assert (
@@ -237,3 +257,53 @@ async def test_db_price_drop_from_outside_range_and_run_logs(tmp_path: Path) -> 
     assert png_bytes.startswith(b"\x89PNG")
     conv = CurrencyConverter()
     assert conv.to_pln_sync(100.0, "EUR") > 350.0
+
+
+def test_caption_html_never_truncates_mid_tag() -> None:
+    import re
+    from bot.models import PriceStats
+
+    sub = Subscription(
+        id=1,
+        chat_id=196462642,
+        set_number="21348",
+        price_from=0.0,
+        price_to=1500.0,
+        set_name="Ideas - Dungeons & Dragons: Red Dragon's Tale",
+        msrp_pln=1549.99,
+        retirement_date="2026-07-31",
+        retirement_source="Brickset (Official LEGO Exit Date)",
+    )
+    long_offers = [
+        Offer(
+            set_number="21348",
+            title=f"LEGO 21348 Offer {i}",
+            source="bricklink.com",
+            store_name=f"Super Long BrickLink Store Name Number {i} (Netherlands)",
+            url=f"https://store.bricklink.com/VeryLongStoreUsername{i}#/shop?o=%7B%22invID%22:%2248793797{i}%22%7D",
+            external_id=f"bl-{i}",
+            item_price_original=300.0 + i,
+            currency_original="EUR",
+            item_price_pln=1311.44 + i,
+            delivery_price_pln=None,
+            delivery_time="Ships from Netherlands (3-5 days)",
+        )
+        for i in range(4)
+    ]
+    stats = PriceStats(
+        set_number="21348",
+        lowest_30d_pln=1311.44,
+        lowest_30d_source="bricklink.com",
+        lowest_30d_date="2026-11-17",
+        lowest_all_time_pln=1311.44,
+        lowest_all_time_source="bricklink.com",
+        lowest_all_time_date="2026-11-17",
+    )
+    caption = LegoMonitorService.format_deal_notification_caption(
+        sub, long_offers[0], long_offers, stats
+    )
+    assert caption.count("<a ") == caption.count("</a>")
+    assert caption.count("<b>") == caption.count("</b>")
+    assert caption.count("<i>") == caption.count("</i>")
+    visible = re.sub(r"<[^>]+>", "", caption)
+    assert len(visible) <= 1024

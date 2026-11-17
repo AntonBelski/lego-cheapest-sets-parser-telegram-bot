@@ -53,6 +53,9 @@ class RetirementInfo:
     source: str
     confidence: str  # "official", "estimated"
     is_already_retired: bool = False
+    set_name: Optional[str] = None
+    msrp_eur: Optional[float] = None
+    image_url: Optional[str] = None
 
 
 def parse_flexible_date(text: str) -> Optional[date]:
@@ -161,12 +164,28 @@ class RetirementService:
     async def _check_brickset(self, set_number: str) -> Optional[RetirementInfo]:
         # Check Brickset web page
         url = f"https://brickset.com/sets/{set_number}-1"
-        status, html, _ = await http_client.get_text(url)
-        if status != 200 or not html:
+        status, html_text, _ = await http_client.get_text(url)
+        if status != 200 or not html_text:
             return None
 
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html_text, "lxml")
         text = soup.get_text(" ", strip=True)
+
+        set_name: Optional[str] = None
+        h1 = soup.find("h1")
+        if h1:
+            raw_h1 = h1.get_text(" ", strip=True)
+            set_name = re.sub(rf"^{re.escape(set_number)}\s*[-–:]?\s*", "", raw_h1).strip() or raw_h1
+
+        msrp_eur: Optional[float] = None
+        eur_m = re.search(r"€\s*(\d+(?:[.,]\d{1,2})?)", text)
+        if eur_m:
+            try:
+                msrp_eur = float(eur_m.group(1).replace(",", "."))
+            except ValueError:
+                msrp_eur = None
+
+        img_url = f"https://images.brickset.com/sets/images/{set_number}-1.jpg"
 
         # Look for "Launch/exit 01 Mar 23 - 31 Dec 26" or "Exit date: 31 Dec 2026"
         m = re.search(
@@ -186,9 +205,20 @@ class RetirementService:
                     source="Brickset (Official LEGO Exit Date)",
                     confidence="official",
                     is_already_retired=dt < datetime.utcnow().date(),
+                    set_name=set_name,
+                    msrp_eur=msrp_eur,
+                    image_url=img_url,
                 )
 
-        return None
+        return RetirementInfo(
+            set_number=set_number,
+            retirement_date=None,
+            source="Brickset",
+            confidence="official",
+            set_name=set_name,
+            msrp_eur=msrp_eur,
+            image_url=img_url,
+        )
 
     async def _check_brickeconomy(self, set_number: str) -> Optional[RetirementInfo]:
         url = f"https://www.brickeconomy.com/set/{set_number}-1/"

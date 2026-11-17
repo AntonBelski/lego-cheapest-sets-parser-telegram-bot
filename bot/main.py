@@ -64,10 +64,17 @@ async def drain_pending_telegram_updates(bot: Bot, dp) -> int:
                 break
             for upd in updates:
                 offset = upd.update_id + 1
-                await dp.feed_update(bot, upd)
-                processed += 1
+                try:
+                    await dp.feed_update(bot, upd)
+                    processed += 1
+                except Exception as upd_exc:
+                    logger.warning(
+                        "Failed handling update_id=%s in one-shot mode: %s",
+                        upd.update_id,
+                        upd_exc,
+                    )
         if offset is not None:
-            # Acknowledge last update_id so it isn't re-processed next cron run
+            # Always acknowledge last update_id so updates aren't re-processed next cron run
             await bot.get_updates(offset=offset, timeout=1, limit=1)
     except Exception as exc:
         logger.warning("Error draining Telegram updates in one-shot mode: %s", exc)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -76,15 +77,22 @@ class LegoMonitorService:
         meta, offers, history_points = await self.promoklocki.fetch_metadata_and_history(
             set_number
         )
-        # Also resolve retirement date on initial subscription so notifications always have it
+        # Also resolve retirement date & fallback metadata from Brickset/BrickEconomy
         try:
             ret_info = await retirement_service.fetch_retirement_info(set_number)
-            if ret_info and ret_info.retirement_date:
+            if ret_info:
                 if meta is None:
                     meta = SetMetadata(set_number=set_number)
-                meta.retirement_date = ret_info.retirement_date
-                meta.retirement_source = ret_info.source
-                meta.is_retired = ret_info.is_already_retired
+                if ret_info.retirement_date:
+                    meta.retirement_date = ret_info.retirement_date
+                    meta.retirement_source = ret_info.source
+                    meta.is_retired = ret_info.is_already_retired
+                if not meta.name and ret_info.set_name:
+                    meta.name = ret_info.set_name
+                if not meta.image_url and ret_info.image_url:
+                    meta.image_url = ret_info.image_url
+                if not meta.msrp_pln and ret_info.msrp_eur:
+                    meta.msrp_pln = await currency_converter.to_pln(ret_info.msrp_eur, "EUR")
         except Exception as exc:
             logger.debug("Initial retirement lookup error for %s: %s", set_number, exc)
 
@@ -125,22 +133,35 @@ class LegoMonitorService:
             (s.msrp_pln for s in subs_for_set if s.msrp_pln), None
         )
 
-        # Ensure retirement date is populated if missing
-        has_ret_date = any(s.retirement_date for s in subs_for_set)
-        if not has_ret_date:
+        # Ensure set name, fallback MSRP, image, and retirement date are populated if missing
+        needs_meta = any(
+            not s.retirement_date or not s.set_name or not s.msrp_pln
+            for s in subs_for_set
+        )
+        if needs_meta:
             try:
                 ret_info = await retirement_service.fetch_retirement_info(set_number)
-                if ret_info and ret_info.retirement_date:
+                if ret_info:
+                    est_msrp = (
+                        await currency_converter.to_pln(ret_info.msrp_eur, "EUR")
+                        if ret_info.msrp_eur
+                        else None
+                    )
+                    if not msrp_pln and est_msrp:
+                        msrp_pln = est_msrp
                     await self.db.update_set_metadata(
                         SetMetadata(
                             set_number=set_number,
+                            name=ret_info.set_name or "",
+                            msrp_pln=est_msrp,
+                            image_url=ret_info.image_url,
                             retirement_date=ret_info.retirement_date,
                             retirement_source=ret_info.source,
                             is_retired=ret_info.is_already_retired,
                         )
                     )
             except Exception as exc:
-                logger.debug("Retirement lookup during scan failed for %s: %s", set_number, exc)
+                logger.debug("Retirement/metadata lookup during scan failed for %s: %s", set_number, exc)
 
         site_reports: list[ScraperSiteReport] = []
         all_offers: list[Offer] = []
@@ -478,9 +499,10 @@ class LegoMonitorService:
             ]
         )
 
+        offer_lines: list[str] = []
         for idx, off in enumerate(top_new_offers, start=1):
             deliv_note = (
-                f" | 🚚 {html.escape(off.delivery_time)}"
+                f" | 🚚 {html.escape(off.delivery_time[:35])}"
                 if off.delivery_time
                 else ""
             )
@@ -489,13 +511,21 @@ class LegoMonitorService:
                 if off.currency_original.upper() != "PLN"
                 else ""
             )
-            lines.append(
-                f"{idx}. <a href=\"{html.escape(off.url)}\"><b>{html.escape(off.store_name)}</b></a> — "
+            offer_lines.append(
+                f"{idx}. <a href=\"{html.escape(off.url, quote=True)}\"><b>{html.escape(off.store_name[:45])}</b></a> — "
                 f"<b>{html.escape(off.formatted_price)}</b>{orig_note} "
                 f"(<i>{html.escape(off.condition)}</i>{deliv_note})"
             )
 
-        return "\n".join(lines)[:1020]
+        # Safely fit caption within Telegram's 1024-char limit without ever slicing inside an HTML tag
+        base_text = "\n".join(lines)
+        for keep_count in range(len(offer_lines), 0, -1):
+            candidate = base_text + "\n" + "\n".join(offer_lines[:keep_count])
+            visible_text = re.sub(r"<[^>]+>", "", candidate)
+            if len(visible_text) <= 1000 and len(candidate) <= 1800:
+                return candidate
+
+        return base_text[:980]
 
     # -------------------------------------------------------------------------
     # Retirement Date Checking (Every ~5 days)

@@ -195,6 +195,23 @@ class Database:
                 """
             )
 
+            await db.execute(
+                """
+                DELETE FROM price_observations
+                WHERE LOWER(title) LIKE '%jak lego%'
+                   OR LOWER(title) LIKE '%w stylu lego%';
+                """
+            )
+            await db.execute(
+                """
+                DELETE FROM daily_lowest_prices
+                WHERE set_number IN (SELECT set_number FROM subscriptions WHERE msrp_pln > 100)
+                  AND lowest_total_pln < (
+                      SELECT MAX(msrp_pln) * 0.18 FROM subscriptions s WHERE s.set_number = daily_lowest_prices.set_number
+                  );
+                """
+            )
+
             await db.commit()
 
     # -------------------------------------------------------------------------
@@ -276,6 +293,16 @@ class Database:
                     meta.set_number,
                 ),
             )
+            if meta.msrp_pln and meta.msrp_pln > 100:
+                floor_pln = meta.msrp_pln * 0.18
+                await db.execute(
+                    "DELETE FROM price_observations WHERE set_number = ? AND item_price_pln < ?",
+                    (meta.set_number, floor_pln),
+                )
+                await db.execute(
+                    "DELETE FROM daily_lowest_prices WHERE set_number = ? AND lowest_total_pln < ?",
+                    (meta.set_number, floor_pln),
+                )
             await db.commit()
 
     async def get_subscription(self, chat_id: int, set_number: str) -> Optional[Subscription]:
