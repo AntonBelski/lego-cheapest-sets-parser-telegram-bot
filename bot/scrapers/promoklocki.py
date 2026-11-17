@@ -157,7 +157,8 @@ class PromoklockiScraper(BaseScraper):
             ):
                 continue
 
-            ext_id = re.sub(r"[^a-zA-Z0-9_-]", "", href[-32:]) or f"pk-{idx}"
+            clean_store = re.sub(r"[^a-z0-9_-]", "", store_name.lower())
+            ext_id = f"pk-{set_number}-{clean_store or idx}"
             offers.append(
                 Offer(
                     set_number=set_number,

@@ -157,9 +157,10 @@ class CeneoScraper(BaseScraper):
                     if href.startswith("http")
                     else (f"https://www.ceneo.pl{href}" if href else prod_url)
                 )
+                clean_shop = re.sub(r"[^a-z0-9_-]", "", (shop_domain or f"shop{idx}").lower())
                 offer_id = str(
                     node.get("data-offer-id")
-                    or f"ceneo-{pid}-{shop_domain or idx}-{int(item_price)}"
+                    or f"ceneo-{pid}-{clean_shop}"
                 )
 
                 offers.append(

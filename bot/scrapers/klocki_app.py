@@ -90,7 +90,8 @@ class KlockiAppScraper(BaseScraper):
                 store_name = f"{seller_m.group(1)} (via zklockow.pl)"
 
             full_url = href if href.startswith("http") else f"https://zklockow.pl{href}"
-            ext_id = re.sub(r"[^a-zA-Z0-9_-]", "", href[-40:-10]) or f"zk-{idx}"
+            clean_store = re.sub(r"[^a-z0-9_-]", "", store_name.lower())
+            ext_id = f"zk-{set_number}-{clean_store or idx}"
 
             offers.append(
                 Offer(
