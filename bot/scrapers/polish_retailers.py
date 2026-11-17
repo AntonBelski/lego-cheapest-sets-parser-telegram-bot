@@ -343,6 +343,32 @@ class MediaExpertScraper(_BasePolishRetailerScraper):
                     )
                 ]
 
+        # Datacenter IP fallback via Promoklocki / Ceneo aggregator when MediaExpert WAF blocks US Azure IPs
+        from bot.scrapers.promoklocki import PromoklockiScraper
+        pk = PromoklockiScraper()
+        _, pk_offers, _ = await pk.fetch_metadata_and_history(set_number)
+        if pk.last_error is None:
+            self.last_error = None
+            for off in pk_offers:
+                if "mediaexpert" in off.store_name.lower() or "mediaexpert" in off.url.lower():
+                    return [
+                        Offer(
+                            set_number=set_number,
+                            title=off.title,
+                            source=self.source_name,
+                            store_name=self.store_label,
+                            url=off.url,
+                            external_id=f"me-{set_number}",
+                            item_price_original=off.item_price_original,
+                            currency_original="PLN",
+                            item_price_pln=off.item_price_pln,
+                            delivery_price_pln=0.0 if off.item_price_pln >= self.free_shipping_threshold else self.standard_shipping,
+                            delivery_time="1-2 dni robocze",
+                            condition="New (Sealed)",
+                        )
+                    ]
+            return []
+
         if status != 200 or not html:
             self._record_failure(f"HTTP {status} on {url}")
         return []

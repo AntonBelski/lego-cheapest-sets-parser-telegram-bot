@@ -8,16 +8,43 @@ from bot.models import Offer, ScraperSiteReport, SetMetadata
 
 
 def parse_price_number(raw: str) -> Optional[float]:
-    """Extract a float price from strings like '1 249,99 zł', '399.00 EUR', 'od 450,50'."""
+    """
+    Extract a float price from strings like:
+    - '1 249,99 zł' -> 1249.99
+    - 'PLN 1,448.58' or 'USD 1,000.00' -> 1448.58 / 1000.00
+    - '1.448,58 EUR' -> 1448.58
+    - '399.00 EUR' -> 399.00
+    """
     if not raw:
         return None
-    cleaned = raw.replace("\xa0", " ").replace(" ", "")
-    match = re.search(r"(\d+(?:[.,]\d{1,2})?)", cleaned)
+    cleaned = raw.replace("\xa0", " ").replace("\u202f", " ")
+    # Match numbers with optional thousands separators (space, comma, or dot) and optional 1-2 decimal digits
+    match = re.search(
+        r"(\d{1,3}(?:[ ,.]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)",
+        cleaned,
+    )
     if not match:
         return None
-    val_str = match.group(1).replace(",", ".")
+    token = match.group(1).replace(" ", "")
+    if "," in token and "." in token:
+        if token.rfind(".") > token.rfind(","):
+            # e.g. '1,448.58' -> comma is thousands, dot is decimal
+            token = token.replace(",", "")
+        else:
+            # e.g. '1.448,58' -> dot is thousands, comma is decimal
+            token = token.replace(".", "").replace(",", ".")
+    elif "," in token:
+        parts = token.split(",")
+        if len(parts[-1]) == 3 and len(parts) >= 2:
+            token = "".join(parts)
+        else:
+            token = token.replace(",", ".")
+    elif "." in token:
+        parts = token.split(".")
+        if len(parts[-1]) == 3 and len(parts) >= 2:
+            token = "".join(parts)
     try:
-        val = float(val_str)
+        val = float(token)
         return val if val > 0 else None
     except ValueError:
         return None
