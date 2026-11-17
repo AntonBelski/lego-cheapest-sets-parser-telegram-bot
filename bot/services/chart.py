@@ -50,6 +50,22 @@ async def fetch_set_image_pil(set_number: str, preferred_url: Optional[str] = No
     return None
 
 
+async def fetch_set_image_bytes(
+    set_number: str, preferred_url: Optional[str] = None
+) -> Optional[bytes]:
+    """
+    Download just the official LEGO set image bytes (PNG/JPEG) for deal notifications.
+    """
+    pil_img = await fetch_set_image_pil(set_number, preferred_url)
+    if pil_img is None:
+        return None
+    buf = io.BytesIO()
+    bg = Image.new("RGBA", pil_img.size, (255, 255, 255, 255))
+    composite = Image.alpha_composite(bg, pil_img).convert("RGB")
+    composite.save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
 async def render_deal_card_with_chart(
     subscription: Subscription,
     stats: PriceStats,

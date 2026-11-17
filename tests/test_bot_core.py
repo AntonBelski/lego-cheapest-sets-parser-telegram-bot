@@ -84,6 +84,22 @@ def test_authenticity_and_condition_filtering() -> None:
         "Dungeons & Dragons 21348 – Opowieść o Czerwonym Smoku – odpowiednik LEGO – Nowy",
         set_number="21348",
     )
+    assert not is_authentic_and_complete_set(
+        "ACRYL PLEXIGLAS TEAK - SHOWCASE - TEK FÜR LEGO® SET 21348 - Dungeons & Dragons",
+        set_number="21348",
+    )
+    assert not is_authentic_and_complete_set(
+        "NEU Lego Ideas 21348 Dungeons & Dragons: Red Dragon's Tale - nur Aschenputtel",
+        set_number="21348",
+    )
+    assert not is_authentic_and_complete_set(
+        "LMB 2.0 Beleuchtungsset für LEGO The Botanical Garden 21353 geeignet",
+        set_number="21353",
+    )
+    assert not is_authentic_and_complete_set(
+        "LEGO® TEC Skianzug Schneeanzug Snowsuit 21348 LWJULIAN 711-894 NEU Gr. 86 /18mon",
+        set_number="21348",
+    )
 
     # URL sanitization for Telegram <a href="..."> (no raw '{', '}', or '"')
     raw_bl = 'https://store.bricklink.com/Masleeuw#/shop?o={"invID":"487937970"}'

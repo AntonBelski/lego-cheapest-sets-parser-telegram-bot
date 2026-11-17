@@ -38,7 +38,7 @@ from bot.scrapers.polish_retailers import (
 )
 from bot.scrapers.promoklocki import PromoklockiScraper
 from bot.scrapers.vinted import VintedScraper
-from bot.services.chart import render_deal_card_with_chart
+from bot.services.chart import fetch_set_image_bytes, render_deal_card_with_chart
 from bot.services.currency import currency_converter
 from bot.services.filter import is_valid_offer_url
 from bot.services.http_client import http_client
@@ -83,7 +83,7 @@ class LegoMonitorService:
         meta, offers, history_points = await self.promoklocki.fetch_metadata_and_history(
             set_number
         )
-        # Also resolve retirement date & fallback metadata from Brickset/BrickEconomy
+        # Also resolve retirement date & English set name from Brickset/BrickEconomy
         try:
             ret_info = await retirement_service.fetch_retirement_info(set_number)
             if ret_info:
@@ -93,7 +93,7 @@ class LegoMonitorService:
                     meta.retirement_date = ret_info.retirement_date
                     meta.retirement_source = ret_info.source
                     meta.is_retired = ret_info.is_already_retired
-                if not meta.name and ret_info.set_name:
+                if ret_info.set_name:
                     meta.name = ret_info.set_name
                 if not meta.image_url and ret_info.image_url:
                     meta.image_url = ret_info.image_url
@@ -172,7 +172,11 @@ class LegoMonitorService:
         site_reports: list[ScraperSiteReport] = []
         all_offers: list[Offer] = []
 
-        # 1. Fetch Promoklocki first so we always have MSRP, set name, and image URL
+        # 1. Fetch Promoklocki first so we always have MSRP and image URL
+        english_name: Optional[str] = None
+        if any(s.set_name for s in subs_for_set):
+            english_name = next((s.set_name for s in subs_for_set if s.set_name), None)
+
         self.promoklocki._reset_run_trace()
         try:
             meta, pk_offers, history_pts = await self.promoklocki.fetch_metadata_and_history(
@@ -181,6 +185,8 @@ class LegoMonitorService:
             if meta:
                 if meta.msrp_pln:
                     msrp_pln = meta.msrp_pln
+                if english_name:
+                    meta.name = english_name
                 await self.db.update_set_metadata(meta)
             if history_pts:
                 await self.db.seed_historical_daily_prices(set_number, history_pts)
@@ -417,24 +423,31 @@ class LegoMonitorService:
         )
 
         try:
-            chart_bytes = await render_deal_card_with_chart(
-                subscription=sub,
-                stats=stats,
-                current_best_pln=best_offer.total_price_pln,
-            )
-            photo_file = BufferedInputFile(
-                chart_bytes,
-                filename=f"lego_{sub.set_number}_price_dynamics.png",
+            img_bytes = await fetch_set_image_bytes(
+                set_number=sub.set_number,
+                preferred_url=sub.image_url or best_offer.image_url,
             )
             if self.bot:
-                await self.bot.send_photo(
-                    chat_id=sub.chat_id,
-                    photo=photo_file,
-                    caption=caption,
-                    parse_mode="HTML",
-                )
-                # If there are more than 3 new offers (up to 20), send all of them in a single message
-                if len(top_batch) > 3:
+                if img_bytes:
+                    photo_file = BufferedInputFile(
+                        img_bytes,
+                        filename=f"lego_{sub.set_number}.jpg",
+                    )
+                    await self.bot.send_photo(
+                        chat_id=sub.chat_id,
+                        photo=photo_file,
+                        caption=caption,
+                        parse_mode="HTML",
+                    )
+                else:
+                    await self.bot.send_message(
+                        chat_id=sub.chat_id,
+                        text=caption,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                # If there are multiple new offers (up to 20), send all of them in a single message
+                if len(top_batch) > 1:
                     batch_text = self.format_full_offers_batch_message(sub, top_batch)
                     await self.bot.send_message(
                         chat_id=sub.chat_id,
@@ -500,100 +513,49 @@ class LegoMonitorService:
         top_new_offers: list[Offer],
         stats: PriceStats,
     ) -> str:
-        set_title = html.escape(
-            sub.set_name or best.title or f"Set {sub.set_number}"
-        )
-        msrp_line = "N/A"
-        if sub.msrp_pln and sub.msrp_pln > 0:
-            diff_pct = (
-                (sub.msrp_pln - best.total_price_pln) / sub.msrp_pln
-            ) * 100
-            disc_badge = (
-                f" (<b>-{diff_pct:.1f}%</b> vs LEGO MSRP)"
-                if diff_pct > 0
-                else f" (+{abs(diff_pct):.1f}% vs LEGO MSRP)"
-            )
-            msrp_line = f"<b>{sub.msrp_pln:.2f} PLN</b>{disc_badge}"
-
-        low_30d_src = html.escape(format_source_label(stats.lowest_30d_source))
-        low_all_src = html.escape(format_source_label(stats.lowest_all_time_source))
-
-        low_30d_line = (
-            f"<b>{stats.lowest_30d_pln:.2f} PLN</b> ({low_30d_src}, {stats.lowest_30d_date})"
-            if stats.lowest_30d_pln
-            else f"<b>{best.total_price_pln:.2f} PLN</b> (today)"
-        )
-        low_all_line = (
-            f"<b>{stats.lowest_all_time_pln:.2f} PLN</b> ({low_all_src}, {stats.lowest_all_time_date})"
-            if stats.lowest_all_time_pln
-            else f"<b>{best.total_price_pln:.2f} PLN</b> (today)"
-        )
-
-        ret_line = format_retirement_status_and_countdown(
-            sub.retirement_date, sub.retirement_source
-        )
-
-        header_title = (
-            f"📉 <b>PRICE DROP IN YOUR RANGE: LEGO {html.escape(sub.set_number)}</b>"
-            if best.previous_price_pln is not None
-            else f"🔥 <b>NEW LOW PRICE IN YOUR RANGE: LEGO {html.escape(sub.set_number)}</b>"
-        )
-
-        best_href = html.escape(sanitize_url_for_telegram(best.url), quote=True)
-        lines = [
-            header_title,
-            f"🧱 <b>{set_title}</b>",
+        raw_name = (sub.set_name or best.title or f"Set {sub.set_number}").strip()
+        raw_name = re.sub(
+            rf"^LEGO\s*®?\s*(?:Ideas\s+|Star Wars\s+|Technic\s+|Icons\s+|Creator\s+|City\s+|Marvel\s+|Harry Potter\s+|Ninjago\s+)?{re.escape(sub.set_number)}\s*[-–:]?\s*",
             "",
-            f"🏷 <b>Official LEGO Catalog Price:</b> {msrp_line}",
-            f"💰 <b>Current Best Price:</b> <a href=\"{best_href}\"><b>{html.escape(best.formatted_price)} ↗</b></a>",
-        ]
+            raw_name,
+            flags=re.I,
+        ).strip() or raw_name
+        set_title = html.escape(raw_name)
 
-        if (
-            best.previous_price_pln is not None
-            and abs(best.previous_price_pln - best.total_price_pln) >= 1.0
-        ):
-            delta = best.previous_price_pln - best.total_price_pln
-            lines.append(
-                f"🔄 <b>Price Change:</b> <s>{best.previous_price_pln:.2f} PLN</s> ➔ "
-                f"<b>{best.total_price_pln:.2f} PLN</b> (<b>-{delta:.2f} PLN</b>)"
+        msrp_str = f"{sub.msrp_pln:.2f} PLN" if (sub.msrp_pln and sub.msrp_pln > 0) else "N/A"
+
+        detail_parts: list[str] = []
+        if best.delivery_price_pln is None:
+            detail_parts.append("delivery price unknown")
+        elif best.delivery_price_pln == 0:
+            detail_parts.append("free delivery")
+        else:
+            detail_parts.append(
+                f"{best.item_price_pln:.2f} PLN + {best.delivery_price_pln:.2f} PLN delivery"
             )
 
-        if best.delivery_price_pln is None:
-            deliv_status_str = "Unknown (delivery price not specified by seller)"
-        elif best.delivery_price_pln == 0:
-            deliv_status_str = "Free delivery (0.00 PLN)"
-        else:
-            deliv_status_str = f"{best.delivery_price_pln:.2f} PLN ({best.item_price_pln:.2f} PLN + {best.delivery_price_pln:.2f} PLN)"
+        if sub.msrp_pln and sub.msrp_pln > 0:
+            diff_pct = ((sub.msrp_pln - best.total_price_pln) / sub.msrp_pln) * 100
+            if diff_pct > 0:
+                detail_parts.append(f"-{diff_pct:.1f}% vs LEGO MSRP")
+            else:
+                detail_parts.append(f"+{abs(diff_pct):.1f}% vs LEGO MSRP")
 
-        lines.extend(
-            [
-                f"📦 <b>Condition:</b> {html.escape(best.condition)}",
-                f"📬 <b>Delivery Cost:</b> {html.escape(deliv_status_str)}",
-                f"🚚 <b>Delivery Time:</b> {html.escape(best.delivery_time or 'Unknown (check seller page)')}",
-                f"🎯 <b>Your Price Range:</b> {html.escape(sub.formatted_range)}",
-                "",
-                f"📉 <b>Lowest (Last 30 Days):</b> {low_30d_line}",
-                f"🏆 <b>Lowest (ALL TIME):</b> {low_all_line}",
-                f"⏳ <b>Retirement Status:</b> {html.escape(ret_line)}",
-                "",
-                "🛒 <b>Buy Right Now (New / Price-Dropped Links):</b>",
-            ]
-        )
+        details_str = ", ".join(detail_parts)
+        best_href = html.escape(sanitize_url_for_telegram(best.url), quote=True)
+        store_link = f'<a href="{best_href}"><b>{html.escape(best.store_name)}</b></a>'
 
-        offer_lines: list[str] = [
-            cls._format_single_offer_html_line(idx, off)
-            for idx, off in enumerate(top_new_offers, start=1)
+        ret_line = format_retirement_status_and_countdown(sub.retirement_date, None)
+
+        lines = [
+            f"<b>LEGO {html.escape(sub.set_number)} - {set_title}</b>",
+            f"Official LEGO Catalog Price: <b>{msrp_str}</b>",
+            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({html.escape(details_str)}) {store_link}",
+            "",
+            f"Your Price Range: <b>{html.escape(sub.formatted_range)}</b>",
+            f"Retirement Status: {html.escape(ret_line)}",
         ]
-
-        # Safely fit caption within Telegram's 1024-char limit without ever slicing inside an HTML tag
-        base_text = "\n".join(lines)
-        for keep_count in range(len(offer_lines), 0, -1):
-            candidate = base_text + "\n" + "\n".join(offer_lines[:keep_count])
-            visible_text = re.sub(r"<[^>]+>", "", candidate)
-            if len(visible_text) <= 1000 and len(candidate) <= 1800:
-                return candidate
-
-        return base_text[:980]
+        return "\n".join(lines)[:1000]
 
     # -------------------------------------------------------------------------
     # Retirement Date Checking (Every ~5 days)

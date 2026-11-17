@@ -79,7 +79,7 @@ class EbayScraper(BaseScraper):
             if full_scan and count_raw_items < 20:
                 break
 
-        if any_200:
+        if offers:
             self.last_error = None
             return offers
 
