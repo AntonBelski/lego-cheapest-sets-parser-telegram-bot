@@ -34,9 +34,12 @@ class CeneoScraper(BaseScraper):
         msrp_pln: Optional[float] = None,
         full_scan: bool = False,
     ) -> list[Offer]:
-        search_url = f"https://www.ceneo.pl/;szukaj-lego+{set_number}"
+        search_url = f"https://www.ceneo.pl/Klocki;szukaj-lego+{set_number}.htm"
         self._record_url(search_url)
-        status, html, _ = await http_client.get_text(search_url)
+        status, html, _ = await http_client.get_text(
+            search_url,
+            use_jina_html_on_block=False,
+        )
         if status != 200 or not html:
             self._record_failure(f"HTTP {status} on {search_url}")
             return []
@@ -61,18 +64,21 @@ class CeneoScraper(BaseScraper):
         offers: list[Offer] = []
 
         # Step 2: Open the Ceneo product page sorted by price ascending (;0280-0.htm)
-        for pid in product_ids[:2]:
+        for pid in product_ids[:1]:
             prod_url = f"https://www.ceneo.pl/{pid};0280-0.htm"
             self._record_url(prod_url)
-            p_status, p_html, _ = await http_client.get_text(prod_url)
+            p_status, p_html, _ = await http_client.get_text(
+                prod_url,
+                use_jina_html_on_block=False,
+            )
             if p_status != 200 or not p_html:
                 self._record_failure(f"HTTP {p_status} on {prod_url}")
                 continue
 
             psoup = BeautifulSoup(p_html, "lxml")
-            offer_nodes = psoup.select(
-                ".product-offer__container, li.product-offers__list__item"
-            )
+            offer_nodes = psoup.select(".product-offer__container")
+            if not offer_nodes:
+                offer_nodes = psoup.select("li.product-offers__list__item")
             for idx, node in enumerate(offer_nodes):
                 node_text = node.get_text(" ", strip=True)
                 title_el = node.select_one(
@@ -88,7 +94,11 @@ class CeneoScraper(BaseScraper):
                 if not contains_set_number(f"{title} {node_text}", set_number):
                     continue
 
-                raw_price_attr = node.get("data-price")
+                btn_el = node.select_one("button[data-price]")
+                raw_price_attr = (
+                    node.get("data-price")
+                    or (btn_el.get("data-price") if btn_el else None)
+                )
                 if raw_price_attr:
                     item_price = parse_price_number(str(raw_price_attr))
                 else:
@@ -103,7 +113,6 @@ class CeneoScraper(BaseScraper):
 
                 if not is_authentic_and_complete_set(
                     title=title,
-                    description=node_text,
                     set_number=set_number,
                     msrp_pln=msrp_pln,
                     item_price_pln=item_price,
@@ -146,21 +155,33 @@ class CeneoScraper(BaseScraper):
                     logo_img = node.select_one("img[alt]")
                     if logo_img and logo_img.get("alt"):
                         shop_domain = str(logo_img.get("alt")).strip()
+                if not shop_domain:
+                    shop_id = str(node.get("data-shop") or (btn_el.get("data-shop") if btn_el else "") or "").strip()
+                    shop_domain = f"Ceneo Partner #{shop_id}" if shop_id else "Ceneo.pl Store"
                 store_name = (
-                    f"{shop_domain} (via Ceneo)" if shop_domain else "Ceneo.pl Store"
+                    f"{shop_domain} (via Ceneo)" if "Ceneo" not in shop_domain else shop_domain
                 )
 
-                go_link = node.select_one("a[href*='/Click/'], a.button[href], a[href]")
-                href = str(go_link.get("href", "")) if go_link else ""
-                full_url = (
-                    href
-                    if href.startswith("http")
-                    else (f"https://www.ceneo.pl{href}" if href else prod_url)
-                )
-                clean_shop = re.sub(r"[^a-z0-9_-]", "", (shop_domain or f"shop{idx}").lower())
+                click_url = str(node.get("data-click-url") or "").strip()
+                if click_url:
+                    full_url = (
+                        click_url
+                        if click_url.startswith("http")
+                        else f"https://www.ceneo.pl/{click_url.lstrip('/')}"
+                    )
+                else:
+                    go_link = node.select_one("a[href*='/Click/'], a.button[href]")
+                    href = str(go_link.get("href", "")).strip() if go_link else ""
+                    if href and not href.startswith("#"):
+                        full_url = href if href.startswith("http") else f"https://www.ceneo.pl/{href.lstrip('/')}"
+                    else:
+                        full_url = prod_url
+
                 offer_id = str(
-                    node.get("data-offer-id")
-                    or f"ceneo-{pid}-{clean_shop}"
+                    node.get("data-offer")
+                    or node.get("data-offerid")
+                    or (btn_el.get("data-offerid") if btn_el else "")
+                    or f"ceneo-{pid}-{idx}"
                 )
 
                 offers.append(

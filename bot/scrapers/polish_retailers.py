@@ -142,6 +142,8 @@ class _BasePolishRetailerScraper(BaseScraper):
                 href, set_number
             ):
                 continue
+            if "inny-producent" in href.lower() or "inny producent" in title.lower():
+                continue
 
             text = card.get_text(" ", strip=True)
             # Extract price from dedicated main price elements first (avoiding installment/delivery numbers like "15,90 zł x 110 rat")
@@ -155,7 +157,14 @@ class _BasePolishRetailerScraper(BaseScraper):
             ):
                 p_el = card.select_one(p_sel)
                 if p_el:
-                    p_txt = str(p_el.get("data-price") or p_el.get_text(" ", strip=True))
+                    whole_el = p_el.select_one(".whole")
+                    cents_el = p_el.select_one(".cents")
+                    if whole_el:
+                        w_str = re.sub(r"\s+", "", whole_el.get_text(strip=True))
+                        c_str = re.sub(r"\s+", "", cents_el.get_text(strip=True)) if cents_el else "00"
+                        p_txt = f"{w_str},{c_str}"
+                    else:
+                        p_txt = str(p_el.get("data-price") or p_el.get_text(" ", strip=True))
                     if any(bad in p_txt.lower() for bad in ("rat", "miesięcz", "mies.", "dostaw")):
                         continue
                     candidate = parse_price_number(p_txt)
@@ -285,8 +294,55 @@ class MediaExpertScraper(_BasePolishRetailerScraper):
     ) -> list[Offer]:
         url = f"https://www.mediaexpert.pl/search?query[menu_item]=&query[querystring]=lego%20{set_number}"
         self._record_url(url)
-        status, html, _ = await http_client.get_text(url)
+        status, html, _ = await http_client.get_text(
+            url,
+            use_jina_html_on_block=False,
+        )
+        if status == 200 and html:
+            offers = self._parse_retail_html(html, set_number, msrp_pln)
+            if offers:
+                return offers
+
+        # Fallback if MediaExpert search page blocks a datacenter IP: check zklockow.pl for MediaExpert offer
+        zk_url = f"https://zklockow.pl/lego-{set_number}"
+        zk_status, zk_html, _ = await http_client.get_text(
+            zk_url,
+            use_jina_html_on_block=False,
+        )
+        if zk_status == 200 and zk_html:
+            self.last_error = None
+            soup = BeautifulSoup(zk_html, "lxml")
+            for a_tag in soup.select("a.Off[href]"):
+                txt = a_tag.get_text(" ", strip=True)
+                if "mediaexpert.pl" not in txt.lower():
+                    continue
+                if not contains_set_number(txt, set_number):
+                    continue
+                pm = re.findall(r"(\d[\d\s]*,\s*\d{2})\s*z[łl]", txt, flags=re.I)
+                if not pm:
+                    continue
+                p_val = parse_price_number(pm[0])
+                if not p_val:
+                    continue
+                href = str(a_tag.get("href", "")).strip()
+                full_u = href if href.startswith("http") else f"https://zklockow.pl{href}"
+                return [
+                    Offer(
+                        set_number=set_number,
+                        title=txt.split(" od ")[0].strip()[:120] or f"LEGO {set_number}",
+                        source=self.source_name,
+                        store_name=self.store_label,
+                        url=full_u,
+                        external_id=f"me-{set_number}",
+                        item_price_original=p_val,
+                        currency_original="PLN",
+                        item_price_pln=p_val,
+                        delivery_price_pln=0.0 if p_val >= self.free_shipping_threshold else self.standard_shipping,
+                        delivery_time="1-2 dni robocze",
+                        condition="New (Sealed)",
+                    )
+                ]
+
         if status != 200 or not html:
             self._record_failure(f"HTTP {status} on {url}")
-            return []
-        return self._parse_retail_html(html, set_number, msrp_pln)
+        return []

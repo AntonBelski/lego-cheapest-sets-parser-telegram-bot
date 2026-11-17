@@ -153,7 +153,21 @@ def test_delivery_and_retirement_formatting() -> None:
         delivery_price_pln=None,
     )
     assert offer_unknown_deliv.total_price_pln == 1500.0
-    assert "(+delivery)" in offer_unknown_deliv.formatted_price
+    assert "(delivery price unknown)" in offer_unknown_deliv.formatted_price
+
+    offer_paid_deliv = Offer(
+        set_number="21348",
+        title="LEGO 21348",
+        source="ceneo.pl",
+        store_name="Proshop",
+        url="https://www.ceneo.pl/165836290",
+        external_id="c1",
+        item_price_original=1500.0,
+        currency_original="PLN",
+        item_price_pln=1500.0,
+        delivery_price_pln=14.99,
+    )
+    assert offer_paid_deliv.formatted_price == "1514.99 PLN (1500.00 PLN + 14.99 PLN delivery)"
 
     # Retirement countdown formatting (years, months, weeks, days)
     today = date(2026, 11, 17)

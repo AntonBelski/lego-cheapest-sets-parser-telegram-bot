@@ -31,6 +31,61 @@ def sanitize_url_for_telegram(url: str) -> str:
         )
 
 
+SOURCE_DISPLAY_LABELS: dict[str, str] = {
+    "promoklocki.pl": "Promoklocki",
+    "olx.pl": "OLX",
+    "vinted.pl": "Vinted",
+    "allegrolokalnie.pl": "Allegro Lokalnie",
+    "allegro.pl": "Allegro",
+    "ceneo.pl": "Ceneo",
+    "ebay.pl": "eBay",
+    "bricklink.com": "BrickLink",
+    "brickmerge.de": "Brickmerge",
+    "zklockow.pl": "zklockow",
+    "smyk.com": "Smyk",
+    "empik.com": "Empik",
+    "mediaexpert.pl": "MediaExpert",
+}
+
+
+def format_source_label(source: Optional[str]) -> str:
+    """
+    Return a clean human-readable source name without `.pl`/`.com`/`.de` TLD
+    so Telegram never turns `(ebay.pl, 2026-11-17)` into a link to the main site page.
+    """
+    raw = (source or "").strip()
+    if not raw:
+        return "Store"
+    lower = raw.lower()
+    if lower in SOURCE_DISPLAY_LABELS:
+        return SOURCE_DISPLAY_LABELS[lower]
+    return raw.replace(".", "·")
+
+
+def format_logged_url_with_browser_link(url: str, set_number: str) -> str:
+    """
+    When a scraper queries an internal JSON/AJAX API URL (OLX, Vinted, BrickLink),
+    append the equivalent browser web page URL with all selected filters & sorting in brackets.
+    """
+    u = (url or "").strip()
+    if "olx.pl/api/v1/offers" in u:
+        if "filter_float_price" in u:
+            web_url = f"https://www.olx.pl/oferty/q-lego-{set_number}/?search%5Border%5D=filter_float_price:asc&search%5Bfilter_enum_state%5D%5B0%5D=new"
+        else:
+            web_url = f"https://www.olx.pl/oferty/q-lego-{set_number}/?search%5Border%5D=created_at:desc&search%5Bfilter_enum_state%5D%5B0%5D=new"
+        return f"{u} ({web_url})"
+    if "vinted.pl/api/v2/catalog/items" in u:
+        if "price_low_to_high" in u:
+            web_url = f"https://www.vinted.pl/catalog?search_text=lego%20{set_number}&status_ids[]=6&status_ids[]=1&order=price_low_to_high"
+        else:
+            web_url = f"https://www.vinted.pl/catalog?search_text=lego%20{set_number}&status_ids[]=6&status_ids[]=1&order=newest_first"
+        return f"{u} ({web_url})"
+    if "bricklink.com/ajax/clone/" in u:
+        web_url = f'https://www.bricklink.com/v2/catalog/catalogitem.page?S={set_number}-1#T=S&O={{"cond":"N","ii":0,"ic":0,"iconly":0}}'
+        return f"{u} ({web_url})"
+    return u
+
+
 def format_retirement_status_and_countdown(
     retirement_date_str: Optional[str],
     retirement_source: Optional[str] = None,
@@ -131,15 +186,20 @@ class Offer:
 
     @property
     def formatted_price(self) -> str:
-        """Human-friendly final price with delivery status as requested."""
+        """
+        Human-friendly final price with explicit delivery status:
+        - Unknown delivery: '1250.00 PLN (delivery price unknown)'
+        - Free delivery / Smart!: '1250.00 PLN (free delivery)'
+        - Known paid delivery: '1264.99 PLN (1250.00 PLN + 14.99 PLN delivery)'
+        """
         if self.delivery_price_pln is None:
-            base = f"{self.total_price_pln:.2f} PLN (+delivery)"
+            base = f"{self.total_price_pln:.2f} PLN (delivery price unknown)"
         elif self.delivery_price_pln == 0:
             base = f"{self.total_price_pln:.2f} PLN (free delivery)"
         else:
             base = (
                 f"{self.total_price_pln:.2f} PLN "
-                f"({self.item_price_pln:.2f} + {self.delivery_price_pln:.2f} delivery)"
+                f"({self.item_price_pln:.2f} PLN + {self.delivery_price_pln:.2f} PLN delivery)"
             )
         if (
             self.previous_price_pln is not None
@@ -147,6 +207,28 @@ class Offer:
         ):
             return f"{self.previous_price_pln:.2f} PLN ➔ {base}"
         return base
+
+    def format_log_item_line(self) -> str:
+        """
+        Format scraped item for run logs:
+        <Item name>: <link to the item> (<price in polish zlt or original price and in brackets (~in polish zloty)>)
+        """
+        if self.currency_original.upper() == "PLN":
+            if self.delivery_price_pln is not None and self.delivery_price_pln > 0:
+                price_part = (
+                    f"{self.total_price_pln:.2f} zł "
+                    f"[{self.item_price_pln:.2f} zł + {self.delivery_price_pln:.2f} zł delivery]"
+                )
+            elif self.delivery_price_pln == 0:
+                price_part = f"{self.total_price_pln:.2f} zł [free delivery]"
+            else:
+                price_part = f"{self.total_price_pln:.2f} zł [delivery unknown]"
+        else:
+            price_part = (
+                f"{self.item_price_original:.2f} {self.currency_original.upper()} "
+                f"(~{self.total_price_pln:.2f} zł)"
+            )
+        return f"{self.title}: {self.url} ({price_part})"
 
     @property
     def offer_fingerprint(self) -> str:

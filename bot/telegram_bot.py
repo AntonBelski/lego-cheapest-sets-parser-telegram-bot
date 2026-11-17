@@ -23,6 +23,7 @@ from bot.config import settings
 from bot.db import Database
 from bot.models import (
     format_retirement_status_and_countdown,
+    format_source_label,
     sanitize_url_for_telegram,
 )
 from bot.services.chart import render_deal_card_with_chart
@@ -453,12 +454,14 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         ret_str = format_retirement_status_and_countdown(
             sub.retirement_date, sub.retirement_source
         )
+        low30_src = format_source_label(stats.lowest_30d_source)
+        lowall_src = format_source_label(stats.lowest_all_time_source)
         caption = (
             f"📈 <b>Daily Lowest Price Dynamics: LEGO {html.escape(set_number)}</b>\n"
             f"🧱 <b>{html.escape(sub.set_name or '')}</b>\n"
-            f"🏷 <b>LEGO.pl MSRP:</b> {f'{sub.msrp_pln:.2f} PLN' if sub.msrp_pln else 'N/A'}\n"
-            f"📉 <b>Lowest (Last 30 Days):</b> {f'{stats.lowest_30d_pln:.2f} PLN ({stats.lowest_30d_source})' if stats.lowest_30d_pln else 'N/A'}\n"
-            f"🏆 <b>Lowest (All Time):</b> {f'{stats.lowest_all_time_pln:.2f} PLN ({stats.lowest_all_time_source})' if stats.lowest_all_time_pln else 'N/A'}\n"
+            f"🏷 <b>Official LEGO Catalog Price:</b> {f'{sub.msrp_pln:.2f} PLN' if sub.msrp_pln else 'N/A'}\n"
+            f"📉 <b>Lowest (Last 30 Days):</b> {f'{stats.lowest_30d_pln:.2f} PLN ({low30_src})' if stats.lowest_30d_pln else 'N/A'}\n"
+            f"🏆 <b>Lowest (All Time):</b> {f'{stats.lowest_all_time_pln:.2f} PLN ({lowall_src})' if stats.lowest_all_time_pln else 'N/A'}\n"
             f"⏳ <b>Retirement Status:</b> {html.escape(ret_str)}\n"
             f"🎯 <b>Your Range:</b> {html.escape(sub.formatted_range)}"
         )
@@ -486,11 +489,11 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await _send_top_deals(callback.message, set_number)
 
     async def _send_top_deals(msg: Message, set_number: str) -> None:
-        rows = await db.get_latest_offers(set_number, limit=10)
+        rows = await db.get_latest_offers(set_number, limit=20)
         if not rows:
             wait_m = await msg.answer(f"🔍 Scanning live offers for <b>LEGO {html.escape(set_number)}</b>...", parse_mode="HTML")
             await monitor.scan_single_set(set_number)
-            rows = await db.get_latest_offers(set_number, limit=10)
+            rows = await db.get_latest_offers(set_number, limit=20)
             await wait_m.delete()
 
         if not rows:
@@ -510,11 +513,12 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             deliv_known = bool(r["delivery_known"])
             deliv_p = r["delivery_price_pln"]
             if not deliv_known or deliv_p is None:
-                p_str = f"{total_p:.2f} PLN (+delivery)"
+                p_str = f"{total_p:.2f} PLN (delivery price unknown)"
             elif float(deliv_p) == 0:
                 p_str = f"{total_p:.2f} PLN (free delivery)"
             else:
-                p_str = f"{total_p:.2f} PLN (incl. {float(deliv_p):.2f} delivery)"
+                item_p = float(r.get("item_price_pln") or round(total_p - float(deliv_p), 2))
+                p_str = f"{total_p:.2f} PLN ({item_p:.2f} PLN + {float(deliv_p):.2f} PLN delivery)"
 
             if prev_p is not None and abs(float(prev_p) - total_p) >= 1.0:
                 p_str = f"<s>{float(prev_p):.2f} PLN</s> ➔ {p_str}"

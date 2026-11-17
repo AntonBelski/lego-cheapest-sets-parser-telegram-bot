@@ -221,22 +221,15 @@ class AllegroScraper(BaseScraper):
             if api_offers:
                 return api_offers
 
-        # 2. Try direct web listing pages (newest order=n & lowest price order=p)
-        urls_to_fetch = (
-            [
-                f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&order=p&p=1",
-                f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&order=p&p=2",
-                f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&order=n&p=1",
-            ]
-            if full_scan
-            else [
-                f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&order=n&p=1",
-                f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&order=p&p=1",
-            ]
-        )
+        # 2. Try direct web listing pages with "lego {set_number}" (newest order=n & lowest price order=p)
+        urls_to_fetch = [
+            f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&offerTypeBuyNow=1&order=p&p=1",
+            f"https://allegro.pl/listing?string=lego%20{set_number}&stan=nowe&offerTypeBuyNow=1&order=n&p=1",
+        ]
 
         offers: list[Offer] = []
         direct_200 = False
+        product_urls_seen: set[str] = set()
 
         for url in urls_to_fetch:
             self._record_url(url)
@@ -247,87 +240,30 @@ class AllegroScraper(BaseScraper):
             if status == 200 and html and "datadome" not in html.lower():
                 direct_200 = True
                 soup = BeautifulSoup(html, "lxml")
-                articles = soup.select("article[data-analytics-view-value], article")
-                for idx, art in enumerate(articles):
-                    text = art.get_text(" ", strip=True)
-                    a_tag = art.select_one("h2 a[href], a[href*='/oferta/']")
-                    if not a_tag:
-                        continue
-                    title = a_tag.get_text(" ", strip=True) or text[:120]
-                    if not contains_set_number(title, set_number):
-                        continue
+                # Also discover Allegro product page links (/produkt/...) to fetch all seller options
+                for prod_a in soup.select("a[href*='/produkt/']"):
+                    phref = str(prod_a.get("href", "")).split("?")[0].strip()
+                    if phref and contains_set_number(phref, set_number):
+                        full_p = phref if phref.startswith("http") else f"https://allegro.pl{phref}"
+                        product_urls_seen.add(full_p)
 
-                    href = str(a_tag.get("href", "")).strip()
-                    if not href:
-                        continue
-                    full_url = (
-                        href
-                        if href.startswith("http")
-                        else f"https://allegro.pl{href}"
-                    )
-
-                    price_matches = re.findall(
-                        r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", text, flags=re.I
-                    )
-                    if not price_matches:
-                        continue
-                    item_price = parse_price_number(price_matches[0])
-                    if not item_price:
-                        continue
-
-                    if not is_authentic_and_complete_set(
-                        title=title,
-                        set_number=set_number,
-                        msrp_pln=msrp_pln,
-                        item_price_pln=item_price,
-                    ):
-                        continue
-
-                    cond = classify_condition(title=title, description=text)
-                    if not cond:
-                        continue
-
-                    delivery_price: Optional[float] = None
-                    with_deliv = re.search(
-                        r"(\d[\d\s]*[,.]\d{2})\s*z[łl]\s*z\s*dostawą",
-                        text,
-                        flags=re.I,
-                    )
-                    if with_deliv:
-                        total_d = parse_price_number(with_deliv.group(1))
-                        if total_d and total_d >= item_price:
-                            delivery_price = round(total_d - item_price, 2)
-                    elif (
-                        "smart" in text.lower()
-                        or "darmowa dostawa" in text.lower()
-                    ):
-                        delivery_price = 0.0
-
-                    ext_id = str(
-                        art.get("data-analytics-view-value")
-                        or re.sub(r"[^0-9]", "", href)[-14:]
-                        or f"alg-{idx}"
-                    )
-                    offers.append(
-                        Offer(
-                            set_number=set_number,
-                            title=title,
-                            source=self.source_name,
-                            store_name="Allegro.pl Seller",
-                            url=full_url,
-                            external_id=ext_id,
-                            item_price_original=item_price,
-                            currency_original="PLN",
-                            item_price_pln=item_price,
-                            delivery_price_pln=delivery_price,
-                            delivery_time="1-2 dni robocze (Allegro Smart! / InPost)",
-                            condition=cond,
-                        )
-                    )
+                offers.extend(self._parse_allegro_listing_html(soup, set_number, msrp_pln))
             else:
                 self._record_failure(f"HTTP {status} (DataDome/WAF) on {url}")
 
-        # 3. If direct allegro.pl was blocked by DataDome on datacenter IP, use zklockow.pl Allegro feed
+        # Open identified Allegro product page(s) to scrape all seller options at the bottom
+        for prod_url in list(product_urls_seen)[:2]:
+            all_sellers_url = f"{prod_url}?stan=nowe&offerTypeBuyNow=1&order=p"
+            self._record_url(all_sellers_url)
+            p_status, p_html, _ = await http_client.get_text(
+                all_sellers_url,
+                use_jina_html_on_block=False,
+            )
+            if p_status == 200 and p_html and "datadome" not in p_html.lower():
+                psoup = BeautifulSoup(p_html, "lxml")
+                offers.extend(self._parse_allegro_listing_html(psoup, set_number, msrp_pln))
+
+        # 3. If direct allegro.pl was blocked by DataDome on datacenter IP, use zklockow.pl #oferty-allegro feed
         if not direct_200:
             fallback_url = f"https://zklockow.pl/lego-{set_number}"
             self._record_url(fallback_url)
@@ -341,8 +277,16 @@ class AllegroScraper(BaseScraper):
                 for idx, a_tag in enumerate(soup.select("a.Off[href]")):
                     text = a_tag.get_text(" ", strip=True)
                     href = str(a_tag.get("href", "")).strip()
-                    # Only pick Allegro offers ('Idź do oferty' or 'od allegro.pl' / 'Super Sprzedawcy')
-                    if "idź do oferty" not in text.lower() and "allegro.pl" not in text.lower():
+                    if href.startswith("#"):
+                        continue
+                    # Pick all Allegro seller offers ('Super Sprzedawcy', 'Konto: Firma', or 'od allegro.pl')
+                    is_allegro_row = (
+                        "idź do oferty" in text.lower()
+                        or "super sprzedawcy" in text.lower()
+                        or "konto: firma" in text.lower()
+                        or "od allegro.pl" in text.lower()
+                    )
+                    if not is_allegro_row:
                         continue
                     if not contains_set_number(text, set_number):
                         continue
@@ -362,14 +306,28 @@ class AllegroScraper(BaseScraper):
                     ):
                         continue
 
-                    deliv_m = re.search(
-                        r"\+\s*(\d[\d\s]*,\s*\d{2})\s*z[łl]\s*dostawa",
-                        text,
-                        flags=re.I,
+                    # User has Allegro Smart! -> free delivery (0.0 PLN) on Smart-eligible Super Sprzedawcy / Firma offers >= 45 PLN
+                    is_smart_eligible = (
+                        item_price >= 45.0
+                        and (
+                            "smart" in text.lower()
+                            or "darmowa dostawa" in text.lower()
+                            or "super sprzedawcy" in text.lower()
+                            or "konto: firma" in text.lower()
+                            or "od allegro.pl" in text.lower()
+                        )
                     )
-                    delivery_price = (
-                        parse_price_number(deliv_m.group(1)) if deliv_m else None
-                    )
+                    if is_smart_eligible:
+                        delivery_price: Optional[float] = 0.0
+                    else:
+                        deliv_m = re.search(
+                            r"\+\s*(\d[\d\s]*,\s*\d{2})\s*z[łl]\s*dostawa",
+                            text,
+                            flags=re.I,
+                        )
+                        delivery_price = (
+                            parse_price_number(deliv_m.group(1)) if deliv_m else None
+                        )
                     seller_m = re.search(
                         r"\bod\s+(?:Super\s+Sprzedawcy\s+)?([A-Za-z0-9._-]+)",
                         text,
@@ -381,22 +339,21 @@ class AllegroScraper(BaseScraper):
                         else f"https://zklockow.pl{href}"
                     )
                     ext_id = (
-                        re.sub(r"[^a-zA-Z0-9_-]", "", href[-42:-12])
-                        or f"alg-fb-{idx}"
+                        re.sub(r"[^a-zA-Z0-9_-]", "", f"alg-{seller}-{idx}")
                     )
                     offers.append(
                         Offer(
                             set_number=set_number,
                             title=text.split(" od ")[0].strip()[:120],
                             source=self.source_name,
-                            store_name=f"Allegro.pl ({seller})",
+                            store_name=f"Allegro ({seller} - Smart!)" if is_smart_eligible else f"Allegro ({seller})",
                             url=full_url,
                             external_id=ext_id,
                             item_price_original=item_price,
                             currency_original="PLN",
                             item_price_pln=item_price,
                             delivery_price_pln=delivery_price,
-                            delivery_time="1-2 dni robocze (Allegro)",
+                            delivery_time="1-2 dni robocze (Allegro Smart!)" if is_smart_eligible else "1-2 dni robocze (Allegro)",
                             condition="New (Sealed)",
                         )
                     )
@@ -417,7 +374,7 @@ class AllegroScraper(BaseScraper):
                         if not link_el:
                             continue
                         decoded_url = decode_promoklocki_offer_url(str(link_el.get("href", "")))
-                        if "allegro.pl" not in decoded_url.lower():
+                        if "allegro.pl/oferta/" not in decoded_url.lower():
                             continue
                         price_matches = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I)
                         if not price_matches:
@@ -425,7 +382,6 @@ class AllegroScraper(BaseScraper):
                         item_price = parse_price_number(price_matches[0])
                         if not item_price:
                             continue
-                        deliv_p = 0.0 if ("darmowa dostawa" in row_text.lower() or "smart" in row_text.lower()) else None
                         m_id = re.search(r"/oferta/(\d+)", decoded_url)
                         ext_id = m_id.group(1) if m_id else f"alg-pk-{set_number}"
                         offers.append(
@@ -433,13 +389,13 @@ class AllegroScraper(BaseScraper):
                                 set_number=set_number,
                                 title=f"LEGO {set_number} (Allegro Smart!)",
                                 source=self.source_name,
-                                store_name="Allegro.pl (Smart! Offer)",
+                                store_name="Allegro (Smart! Offer)",
                                 url=decoded_url,
                                 external_id=ext_id,
                                 item_price_original=item_price,
                                 currency_original="PLN",
                                 item_price_pln=item_price,
-                                delivery_price_pln=deliv_p,
+                                delivery_price_pln=0.0,
                                 delivery_time="1-2 dni robocze (Allegro Smart!)",
                                 condition="New (Sealed)",
                             )
@@ -447,6 +403,95 @@ class AllegroScraper(BaseScraper):
                         break
 
         return offers
+
+    def _parse_allegro_listing_html(
+        self,
+        soup: BeautifulSoup,
+        set_number: str,
+        msrp_pln: Optional[float],
+    ) -> list[Offer]:
+        parsed: list[Offer] = []
+        articles = soup.select("article[data-analytics-view-value], article")
+        for idx, art in enumerate(articles):
+            text = art.get_text(" ", strip=True)
+            a_tag = art.select_one("h2 a[href], a[href*='/oferta/']")
+            if not a_tag:
+                continue
+            title = a_tag.get_text(" ", strip=True) or text[:120]
+            if not contains_set_number(title, set_number):
+                continue
+
+            href = str(a_tag.get("href", "")).strip()
+            if not href:
+                continue
+            full_url = (
+                href
+                if href.startswith("http")
+                else f"https://allegro.pl{href}"
+            )
+
+            price_matches = re.findall(
+                r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", text, flags=re.I
+            )
+            if not price_matches:
+                continue
+            item_price = parse_price_number(price_matches[0])
+            if not item_price:
+                continue
+
+            if not is_authentic_and_complete_set(
+                title=title,
+                set_number=set_number,
+                msrp_pln=msrp_pln,
+                item_price_pln=item_price,
+            ):
+                continue
+
+            cond = classify_condition(title=title, description=text)
+            if not cond:
+                continue
+
+            # Take Allegro Smart! into account (free delivery when marked Smart or Super Sprzedawca >= 45 PLN)
+            delivery_price: Optional[float] = None
+            if (
+                "smart" in text.lower()
+                or "darmowa dostawa" in text.lower()
+                or (item_price >= 45.0 and "super sprzedawcy" in text.lower())
+            ):
+                delivery_price = 0.0
+            else:
+                with_deliv = re.search(
+                    r"(\d[\d\s]*[,.]\d{2})\s*z[łl]\s*z\s*dostawą",
+                    text,
+                    flags=re.I,
+                )
+                if with_deliv:
+                    total_d = parse_price_number(with_deliv.group(1))
+                    if total_d and total_d >= item_price:
+                        delivery_price = round(total_d - item_price, 2)
+
+            ext_id = str(
+                art.get("data-analytics-view-value")
+                or re.sub(r"[^0-9]", "", href)[-14:]
+                or f"alg-{idx}"
+            )
+            parsed.append(
+                Offer(
+                    set_number=set_number,
+                    title=title,
+                    source=self.source_name,
+                    store_name="Allegro Seller (Smart!)" if delivery_price == 0.0 else "Allegro Seller",
+                    url=full_url,
+                    external_id=ext_id,
+                    item_price_original=item_price,
+                    currency_original="PLN",
+                    item_price_pln=item_price,
+                    delivery_price_pln=delivery_price,
+                    delivery_time="1-2 dni robocze (Allegro Smart! / InPost)",
+                    condition=cond,
+                )
+            )
+        return parsed
 
     async def _fetch_via_rest_api(
         self,

@@ -37,21 +37,21 @@ class KlockiAppScraper(BaseScraper):
             use_jina_html_on_block=False,
         )
         if status != 200 or not html:
-            # Datacenter IP fallback: extract partner Polish store offers via Promoklocki edge relay
+            # Datacenter IP fallback: extract top comparison store offers via Promoklocki edge relay
             from bot.scrapers.promoklocki import PromoklockiScraper
             pk = PromoklockiScraper()
             _, pk_offers, _ = await pk.fetch_metadata_and_history(set_number)
             if pk.last_error is None:
                 self.last_error = None
                 fallback_offers: list[Offer] = []
-                for off in pk_offers:
+                for off in pk_offers[:5]:
                     clean_s = off.store_name.replace(" (Promoklocki)", "")
                     fallback_offers.append(
                         Offer(
                             set_number=off.set_number,
                             title=off.title,
                             source=self.source_name,
-                            store_name=f"{clean_s} (PL Store)",
+                            store_name=f"{clean_s} (via zklockow)",
                             url=off.url,
                             external_id=f"zk-{off.external_id}",
                             item_price_original=off.item_price_original,
@@ -70,11 +70,14 @@ class KlockiAppScraper(BaseScraper):
         soup = BeautifulSoup(html, "lxml")
         offers: list[Offer] = []
 
-        # Every store/Allegro offer on zklockow.pl is an <a class="Off" href="https://zklockow.pl/idz-do/...">
+        # Only parse the top 'Porównaj ceny LEGO® {set_number}' section (rows with 'Typ:'),
+        # while the bottom '#oferty-allegro' individual seller rows are handled by AllegroScraper.
         for idx, a_tag in enumerate(soup.select("a.Off[href]")):
             text = a_tag.get_text(" ", strip=True)
             href = str(a_tag.get("href", "")).strip()
             if not text or not href:
+                continue
+            if "typ:" not in text.lower() or "lego.com" in text.lower():
                 continue
 
             # Double check that this offer is strictly for `set_number`
@@ -97,9 +100,12 @@ class KlockiAppScraper(BaseScraper):
             ):
                 continue
 
-            # Extract delivery price if present (e.g. '+ 14,99 zł dostawa' or 'darmowa dostawa')
+            # Extract delivery price if present (e.g. '+ 14,99 zł dostawa' or 'darmowa dostawa' or Allegro Smart!)
             delivery_price: Optional[float] = None
-            if re.search(r"darmowa\s+dostawa|dostawa\s+gratis|0,00\s*z[łl]\s*dostawa", text, flags=re.I):
+            if (
+                re.search(r"darmowa\s+dostawa|dostawa\s+gratis|0,00\s*z[łl]\s*dostawa", text, flags=re.I)
+                or ("allegro.pl" in text.lower() and item_price >= 45.0)
+            ):
                 delivery_price = 0.0
             else:
                 deliv_m = re.search(
@@ -110,18 +116,24 @@ class KlockiAppScraper(BaseScraper):
                 if deliv_m:
                     delivery_price = parse_price_number(deliv_m.group(1))
 
-            # Extract store/seller name (e.g. 'od mediaexpert.pl' or 'od Super Sprzedawcy PKBricks')
-            store_name = "zklockow.pl Partner"
+            # Extract store/seller name (e.g. 'od mediaexpert.pl')
+            store_name = "zklockow Partner"
             seller_m = re.search(
-                r"\bod\s+(?:Super\s+Sprzedawcy\s+)?([A-Za-z0-9._-]+)",
+                r"\bod\s+([A-Za-z0-9._-]+)",
                 text,
             )
             if seller_m:
-                store_name = f"{seller_m.group(1)} (via zklockow.pl)"
+                store_name = f"{seller_m.group(1)} (via zklockow)"
 
-            full_url = href if href.startswith("http") else f"https://zklockow.pl{href}"
+            if href.startswith("#"):
+                full_url = f"https://zklockow.pl/lego-{set_number}{href}"
+            elif href.startswith("http"):
+                full_url = href
+            else:
+                full_url = f"https://zklockow.pl{href}"
+
             clean_store = re.sub(r"[^a-z0-9_-]", "", store_name.lower())
-            ext_id = f"zk-{set_number}-{clean_store or idx}"
+            ext_id = f"zk-{set_number}-{clean_store}-{idx}"
 
             offers.append(
                 Offer(

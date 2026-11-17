@@ -10,7 +10,11 @@ from bs4 import BeautifulSoup
 
 from bot.models import Offer, SetMetadata
 from bot.scrapers.base import BaseScraper, parse_price_number
-from bot.services.filter import contains_set_number, is_authentic_and_complete_set
+from bot.services.filter import (
+    contains_set_number,
+    is_authentic_and_complete_set,
+    is_valid_offer_url,
+)
 from bot.services.http_client import http_client
 
 logger = logging.getLogger(__name__)
@@ -152,6 +156,10 @@ class PromoklockiScraper(BaseScraper):
                 continue
 
             full_url = decode_promoklocki_offer_url(href)
+            if not is_valid_offer_url(full_url):
+                continue
+            if "oficjalny sklep lego" in row_text.lower():
+                continue
 
             price_matches = re.findall(
                 r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I

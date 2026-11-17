@@ -13,6 +13,7 @@ from aiogram import Bot
 
 from bot.config import settings
 from bot.db import Database
+from bot.services.http_client import http_client
 from bot.services.monitor import LegoMonitorService
 from bot.telegram_bot import build_dispatcher, parse_optional_bound
 
@@ -114,8 +115,16 @@ async def run_once(check_retirement: bool = False) -> None:
             logger.info("Running retirement date check across Brickset / BrickEconomy / Promoklocki...")
             await monitor.check_all_retirement_dates()
     finally:
+        print(http_client.format_api_calls_summary(), flush=True)
         if bot:
             await bot.session.close()
+
+    if monitor.last_run_failed_sites_count > 0:
+        logger.error(
+            "Exiting with code 1 because %d website check(s) failed during the run.",
+            monitor.last_run_failed_sites_count,
+        )
+        sys.exit(1)
 
 
 async def sync_db_state_to_git() -> None:
@@ -190,16 +199,29 @@ async def run_daemon(
     await seed_default_subscriptions(db, monitor)
 
     dp = build_dispatcher(db, monitor)
+    scan_lock = asyncio.Lock()
+    any_scan_failed = False
 
     async def _scheduled_price_scan() -> None:
-        await monitor.scan_all_subscribed_sets()
-        if sync_git_db:
-            await sync_db_state_to_git()
+        nonlocal any_scan_failed
+        try:
+            async with scan_lock:
+                await monitor.scan_all_subscribed_sets()
+                if monitor.last_run_failed_sites_count > 0:
+                    any_scan_failed = True
+                if sync_git_db:
+                    await sync_db_state_to_git()
+        except asyncio.CancelledError:
+            logger.info("Scheduled price scan cancelled cleanly during shutdown.")
 
     async def _scheduled_retirement_scan() -> None:
-        await monitor.check_all_retirement_dates()
-        if sync_git_db:
-            await sync_db_state_to_git()
+        try:
+            async with scan_lock:
+                await monitor.check_all_retirement_dates()
+                if sync_git_db:
+                    await sync_db_state_to_git()
+        except asyncio.CancelledError:
+            logger.info("Scheduled retirement scan cancelled cleanly during shutdown.")
 
     scheduler = AsyncIOScheduler()
     # 1. Every 5 minutes: check prices across all 13 Polish & EU sites
@@ -238,15 +260,19 @@ async def run_daemon(
     stop_timer_task: Optional[asyncio.Task] = None
     if duration_minutes and duration_minutes > 0:
         async def _stop_after_duration() -> None:
-            await asyncio.sleep(duration_minutes * 60)
+            # Stop 15 seconds before the 5-minute interval boundary so we never collide with a new scan tick
+            sleep_sec = max(30, duration_minutes * 60 - 15)
+            await asyncio.sleep(sleep_sec)
             logger.info(
-                "Reached --daemon-minutes=%d window; stopping polling cleanly for next runner handoff...",
+                "Reached --daemon-minutes=%d window; waiting for active scan (if any) and stopping polling cleanly...",
                 duration_minutes,
             )
-            try:
-                await dp.stop_polling()
-            except Exception:
-                pass
+            scheduler.shutdown(wait=False)
+            async with scan_lock:
+                try:
+                    await dp.stop_polling()
+                except Exception:
+                    pass
 
         stop_timer_task = asyncio.create_task(_stop_after_duration())
 
@@ -261,13 +287,21 @@ async def run_daemon(
             stop_timer_task.cancel()
         if not init_task.done():
             try:
-                await asyncio.wait_for(init_task, timeout=30.0)
+                await asyncio.wait_for(init_task, timeout=45.0)
             except Exception:
                 pass
-        scheduler.shutdown(wait=False)
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
         if sync_git_db:
             await sync_db_state_to_git()
+        print(http_client.format_api_calls_summary(), flush=True)
         await bot.session.close()
+
+    if any_scan_failed:
+        logger.error(
+            "Exiting with code 1 because at least one website check failed during this run."
+        )
+        sys.exit(1)
 
 
 def main() -> None:

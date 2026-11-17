@@ -27,7 +27,6 @@ REPLICA_KEYWORDS: tuple[str, ...] = (
     "klocki typu lego",
     "klocki a'la lego",
     "klocki ala lego",
-    "nie lego",
     "not lego",
     "replika",
     "podróbka",
@@ -41,6 +40,8 @@ REPLICA_KEYWORDS: tuple[str, ...] = (
     "klon lego",
     "odpowiednik",
     "zamiennik",
+    "inny-producent",
+    "inny producent",
     "custom moc",
     "aliexpress",
 )
@@ -184,6 +185,8 @@ def is_authentic_and_complete_set(
     for kw in REPLICA_KEYWORDS:
         if kw in combined:
             return False
+    if re.search(r"(?<![a-ząćęłńóśźż])nie\s+lego\b", combined):
+        return False
 
     for kw in PARTIAL_OR_ACCESSORY_KEYWORDS:
         if kw in combined:
@@ -259,3 +262,27 @@ def classify_condition(
         return "New (Open Box, Sealed Bags)"
 
     return "New (Sealed)"
+
+
+def is_valid_offer_url(url: str) -> bool:
+    """
+    Reject links to lego.com promo/general pages or generic marketplace homepages/search pages
+    that are not specific item/offer pages.
+    """
+    u = (url or "").strip().lower()
+    if not u.startswith(("http://", "https://")):
+        return False
+    bad_fragments = (
+        "lego.com/",
+        "shop.lego.com/",
+        "lego-offers-promotions",
+        "/szukaj",
+        "/search?",
+        ";szukaj-",
+        "allegro.pl/kategoria/",
+        "allegro.pl/listing",
+        "rebrickable.com",
+    )
+    if any(b in u for b in bad_fragments):
+        return False
+    return True

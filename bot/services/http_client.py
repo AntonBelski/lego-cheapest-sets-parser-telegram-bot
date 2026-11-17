@@ -17,14 +17,22 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-BROWSER_IMPERSONATIONS = ("chrome124", "chrome120", "safari17_0")
-
-USER_AGENTS = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+BROWSER_PROFILES: tuple[tuple[str, str], ...] = (
+    (
+        "safari17_0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
+    ),
+    (
+        "chrome124",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ),
+    (
+        "chrome120",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    ),
 )
+
+USER_AGENTS = tuple(ua for _, ua in BROWSER_PROFILES)
 
 
 class AntiBlockHttpClient:
@@ -41,6 +49,25 @@ class AntiBlockHttpClient:
         self._domain_locks: dict[str, asyncio.Lock] = {}
         self._domain_last_call: dict[str, float] = {}
         self.total_requests_made: int = 0
+        self.requests_by_domain: dict[str, int] = {}
+
+    def record_external_call(self, url: str) -> None:
+        domain = urlparse(url).netloc.lower() or "unknown"
+        if domain.startswith("www."):
+            domain = domain[4:]
+        self.total_requests_made += 1
+        self.requests_by_domain[domain] = self.requests_by_domain.get(domain, 0) + 1
+
+    def format_api_calls_summary(self) -> str:
+        lines = [
+            "=" * 88,
+            f"EXTERNAL SITE HTTP / API CALLS SUMMARY (Total: {self.total_requests_made} requests)",
+            "=" * 88,
+        ]
+        for dom, cnt in sorted(self.requests_by_domain.items(), key=lambda x: (-x[1], x[0])):
+            lines.append(f"  • {dom:<32} : {cnt} call(s)")
+        lines.append("=" * 88)
+        return "\n".join(lines)
 
     def _get_domain_lock(self, domain: str) -> asyncio.Lock:
         if domain not in self._domain_locks:
@@ -102,7 +129,7 @@ class AntiBlockHttpClient:
         """
         domain = urlparse(url).netloc.lower()
         await self._throttle_domain(domain)
-        self.total_requests_made += 1
+        self.record_external_call(url)
 
         proxy = self._choose_proxy()
         target_url, req_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=False)
@@ -117,7 +144,7 @@ class AntiBlockHttpClient:
         ):
             logger.info("Retrying %s via Cloudflare Worker relay (initial status %d)", domain, status)
             cf_url, cf_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=True)
-            self.total_requests_made += 1
+            self.record_external_call(url)
             status, text, resp_headers = await self._execute_get(cf_url, cf_headers, proxy, timeout)
 
         # 2. Built-in zero-config edge HTML relay fallback for datacenter IPs (GitHub Actions Azure IPs)
@@ -128,13 +155,24 @@ class AntiBlockHttpClient:
         ):
             jina_url = f"https://r.jina.ai/{url}"
             jina_headers = {
-                "User-Agent": random.choice(USER_AGENTS),
+                "User-Agent": USER_AGENTS[0],
                 "X-Return-Format": "html",
             }
             logger.info("Retrying %s via edge HTML relay (initial status %d)", domain, status)
-            self.total_requests_made += 1
+            self.record_external_call(jina_url)
             j_status, j_text, j_hdrs = await self._execute_get(jina_url, jina_headers, proxy, timeout=22.0)
-            if j_status == 200 and j_text and len(j_text) > 1200 and "403 Forbidden" not in j_text[:400]:
+            blocked_markers = (
+                "403 Forbidden",
+                "Warning: Target URL returned error 403",
+                "Dbamy o Twoje bezpieczeństwo",
+                "potwierdzenie, że nie jesteś robotem",
+            )
+            if (
+                j_status == 200
+                and j_text
+                and len(j_text) > 1200
+                and not any(m in j_text[:2500] for m in blocked_markers)
+            ):
                 return 200, j_text, j_hdrs
 
         return status, text, resp_headers
@@ -165,18 +203,26 @@ class AntiBlockHttpClient:
         timeout: float,
     ) -> tuple[int, str, dict[str, str]]:
         if HAS_CURL_CFFI:
-            impersonate = random.choice(BROWSER_IMPERSONATIONS)
-            try:
-                async with CurlAsyncSession(
-                    impersonate=impersonate,
-                    proxy=proxy,
-                    timeout=timeout,
-                ) as session:
-                    resp = await session.get(url, headers=headers, allow_redirects=True)
-                    hdrs = {k.lower(): v for k, v in resp.headers.items()}
-                    return resp.status_code, resp.text, hdrs
-            except Exception as exc:
-                logger.debug("curl_cffi request failed for %s (%s), falling back to httpx", url, exc)
+            # Always pair impersonate profile with its exact matching User-Agent
+            profiles = list(BROWSER_PROFILES)
+            # Prefer safari17_0 first as it passes Polish retail WAFs (MediaExpert, Empik, Ceneo)
+            for idx, (impersonate, matching_ua) in enumerate(profiles[:2]):
+                req_hdrs = dict(headers)
+                req_hdrs["User-Agent"] = matching_ua
+                try:
+                    async with CurlAsyncSession(
+                        impersonate=impersonate,
+                        proxy=proxy,
+                        timeout=timeout,
+                    ) as session:
+                        resp = await session.get(url, headers=req_hdrs, allow_redirects=True)
+                        hdrs = {k.lower(): v for k, v in resp.headers.items()}
+                        if resp.status_code not in (403, 405) or idx == 1:
+                            return resp.status_code, resp.text, hdrs
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("curl_cffi (%s) failed for %s (%s)", impersonate, url, exc)
 
         try:
             async with httpx.AsyncClient(

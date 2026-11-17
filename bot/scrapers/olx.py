@@ -34,24 +34,18 @@ class OlxScraper(BaseScraper):
         msrp_pln: Optional[float] = None,
         full_scan: bool = False,
     ) -> list[Offer]:
-        urls_to_fetch: list[str] = []
-        if full_scan:
-            for offset in (0, 40, 80):
-                urls_to_fetch.append(
-                    f"https://www.olx.pl/api/v1/offers/"
-                    f"?offset={offset}&limit=40&query=lego%20{set_number}&sort_by=filter_float_price%3Aasc"
-                )
-            urls_to_fetch.append(
-                f"https://www.olx.pl/api/v1/offers/"
-                f"?offset=0&limit=40&query=lego%20{set_number}&sort_by=created_at%3Adesc"
-            )
-        else:
-            urls_to_fetch = [
-                f"https://www.olx.pl/api/v1/offers/"
-                f"?offset=0&limit=40&query=lego%20{set_number}&sort_by=created_at%3Adesc",
-                f"https://www.olx.pl/api/v1/offers/"
-                f"?offset=0&limit=40&query=lego%20{set_number}&sort_by=filter_float_price%3Aasc",
-            ]
+        # Always check pages offset=0 and offset=40 sorted by lowest price + offset=0 newest
+        # so offer counts remain consistent across every 5-minute scan
+        offsets = (0, 40, 80) if full_scan else (0, 40)
+        urls_to_fetch: list[str] = [
+            f"https://www.olx.pl/api/v1/offers/"
+            f"?offset={offset}&limit=40&query=lego%20{set_number}&sort_by=filter_float_price%3Aasc"
+            for offset in offsets
+        ]
+        urls_to_fetch.append(
+            f"https://www.olx.pl/api/v1/offers/"
+            f"?offset=0&limit=40&query=lego%20{set_number}&sort_by=created_at%3Adesc"
+        )
 
         offers: list[Offer] = []
         any_200 = False
@@ -163,8 +157,8 @@ class OlxScraper(BaseScraper):
                     )
                 )
 
-            if full_scan and len(items) < 40:
-                break
+            if "filter_float_price" in api_url and len(items) < 40:
+                continue
 
         if any_200:
             self.last_error = None

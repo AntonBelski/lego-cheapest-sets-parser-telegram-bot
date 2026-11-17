@@ -18,7 +18,9 @@ from bot.models import (
     ScraperSiteReport,
     SetMetadata,
     Subscription,
+    format_logged_url_with_browser_link,
     format_retirement_status_and_countdown,
+    format_source_label,
     sanitize_url_for_telegram,
 )
 from bot.scrapers.allegro import AllegroLokalnieScraper, AllegroScraper
@@ -38,6 +40,8 @@ from bot.scrapers.promoklocki import PromoklockiScraper
 from bot.scrapers.vinted import VintedScraper
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import currency_converter
+from bot.services.filter import is_valid_offer_url
+from bot.services.http_client import http_client
 from bot.services.retirement import match_retirement_milestone, retirement_service
 
 logger = logging.getLogger(__name__)
@@ -53,6 +57,7 @@ class LegoMonitorService:
     def __init__(self, db: Database, bot: Optional[Bot] = None) -> None:
         self.db = db
         self.bot = bot
+        self.last_run_failed_sites_count: int = 0
         self.promoklocki = PromoklockiScraper()
         self.scrapers: list[BaseScraper] = [
             OlxScraper(),
@@ -309,6 +314,7 @@ class LegoMonitorService:
         FAILED if at least one website failed (while keeping all valid data in DB).
         """
         failed_reports = [r for r in all_reports if not r.success]
+        self.last_run_failed_sites_count = len(failed_reports)
         total_offers = sum(len(r.offers) for r in all_reports)
         overall_status = (
             "SUCCESS"
@@ -330,14 +336,19 @@ class LegoMonitorService:
 
         for set_num, reps in by_set.items():
             lines.append(f"\n--- LEGO SET {set_num} ---")
-            for r in reps:
+            total_sites = len(reps)
+            for idx, r in enumerate(reps, start=1):
                 badge = "SUCCESS" if r.success else "FAILED "
                 err_tail = f" | Error: {r.error_message}" if r.error_message else ""
+                iter_label = f"{idx}/{total_sites} {r.source}"
                 lines.append(
-                    f"  [{badge}] {r.source:<20} | Offers: {len(r.offers):<3}{err_tail}"
+                    f"  [{badge}] {iter_label:<25} | Offers: {len(r.offers):<3}{err_tail}"
                 )
                 for u in r.urls_scraped:
-                    lines.append(f"            ↳ URL: {u}")
+                    formatted_u = format_logged_url_with_browser_link(u, set_num)
+                    lines.append(f"            ↳ URL: {formatted_u}")
+                for off in r.offers:
+                    lines.append(f"            • {off.format_log_item_line()}")
 
         if failed_reports:
             lines.append(
@@ -351,6 +362,7 @@ class LegoMonitorService:
                 "    (Note: All offers from succeeded websites were preserved in the database.)"
             )
         lines.append("=" * 88)
+        lines.append(http_client.format_api_calls_summary())
 
         summary_text = "\n".join(lines)
         # 1. Print to stdout so GitHub Actions logs show the full scrollable table
@@ -382,7 +394,11 @@ class LegoMonitorService:
         all_offers: list[Offer],
         stats: PriceStats,
     ) -> None:
-        matching = [o for o in all_offers if sub.matches_price(o.total_price_pln)]
+        matching = [
+            o
+            for o in all_offers
+            if sub.matches_price(o.total_price_pln) and is_valid_offer_url(o.url)
+        ]
         if not matching:
             return
 
@@ -395,8 +411,9 @@ class LegoMonitorService:
             return
 
         best_offer = unnotified[0]
+        top_batch = unnotified[:20]
         caption = self.format_deal_notification_caption(
-            sub, best_offer, unnotified[:4], stats
+            sub, best_offer, top_batch[:3], stats
         )
 
         try:
@@ -416,7 +433,18 @@ class LegoMonitorService:
                     caption=caption,
                     parse_mode="HTML",
                 )
-            for off in unnotified[:4]:
+                # If there are more than 3 new offers (up to 20), send all of them in a single message
+                if len(top_batch) > 3:
+                    batch_text = self.format_full_offers_batch_message(sub, top_batch)
+                    await self.bot.send_message(
+                        chat_id=sub.chat_id,
+                        text=batch_text,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+            # Mark ALL unnotified matching offers from this scan as notified so they are
+            # never dripped out in small batches of 2-4 on subsequent 5-minute runs!
+            for off in unnotified:
                 await self.db.mark_offer_notified(sub.chat_id, off)
         except Exception as exc:
             logger.error(
@@ -426,7 +454,47 @@ class LegoMonitorService:
             )
 
     @staticmethod
+    def _format_single_offer_html_line(idx: int, off: Offer) -> str:
+        deliv_note = (
+            f" | 🚚 {html.escape(off.delivery_time[:35])}"
+            if off.delivery_time
+            else ""
+        )
+        orig_note = (
+            f" [{off.item_price_original:.2f} {off.currency_original}]"
+            if off.currency_original.upper() != "PLN"
+            else ""
+        )
+        safe_href = html.escape(sanitize_url_for_telegram(off.url), quote=True)
+        return (
+            f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(off.store_name[:42])}</b></a> — "
+            f"<a href=\"{safe_href}\"><b>{html.escape(off.formatted_price)} ↗</b></a>{orig_note} "
+            f"(<i>{html.escape(off.condition)}</i>{deliv_note})"
+        )
+
+    @classmethod
+    def format_full_offers_batch_message(
+        cls,
+        sub: Subscription,
+        offers: list[Offer],
+    ) -> str:
+        header = (
+            f"🛒 <b>All {len(offers)} New / Price-Dropped Offers for LEGO {html.escape(sub.set_number)} "
+            f"(up to 20 in one message):</b>\n"
+        )
+        output_lines = [header]
+        total_len = len(header)
+        for idx, off in enumerate(offers[:20], start=1):
+            line = cls._format_single_offer_html_line(idx, off)
+            if total_len + len(line) + 1 > 3950:
+                break
+            output_lines.append(line)
+            total_len += len(line) + 1
+        return "\n".join(output_lines)
+
+    @classmethod
     def format_deal_notification_caption(
+        cls,
         sub: Subscription,
         best: Offer,
         top_new_offers: list[Offer],
@@ -441,19 +509,22 @@ class LegoMonitorService:
                 (sub.msrp_pln - best.total_price_pln) / sub.msrp_pln
             ) * 100
             disc_badge = (
-                f" (<b>-{diff_pct:.1f}%</b> vs LEGO.pl)"
+                f" (<b>-{diff_pct:.1f}%</b> vs LEGO MSRP)"
                 if diff_pct > 0
-                else f" (+{abs(diff_pct):.1f}% vs LEGO.pl)"
+                else f" (+{abs(diff_pct):.1f}% vs LEGO MSRP)"
             )
             msrp_line = f"<b>{sub.msrp_pln:.2f} PLN</b>{disc_badge}"
 
+        low_30d_src = html.escape(format_source_label(stats.lowest_30d_source))
+        low_all_src = html.escape(format_source_label(stats.lowest_all_time_source))
+
         low_30d_line = (
-            f"<b>{stats.lowest_30d_pln:.2f} PLN</b> ({html.escape(stats.lowest_30d_source or '')}, {stats.lowest_30d_date})"
+            f"<b>{stats.lowest_30d_pln:.2f} PLN</b> ({low_30d_src}, {stats.lowest_30d_date})"
             if stats.lowest_30d_pln
             else f"<b>{best.total_price_pln:.2f} PLN</b> (today)"
         )
         low_all_line = (
-            f"<b>{stats.lowest_all_time_pln:.2f} PLN</b> ({html.escape(stats.lowest_all_time_source or '')}, {stats.lowest_all_time_date})"
+            f"<b>{stats.lowest_all_time_pln:.2f} PLN</b> ({low_all_src}, {stats.lowest_all_time_date})"
             if stats.lowest_all_time_pln
             else f"<b>{best.total_price_pln:.2f} PLN</b> (today)"
         )
@@ -473,7 +544,7 @@ class LegoMonitorService:
             header_title,
             f"🧱 <b>{set_title}</b>",
             "",
-            f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_line}",
+            f"🏷 <b>Official LEGO Catalog Price:</b> {msrp_line}",
             f"💰 <b>Current Best Price:</b> <a href=\"{best_href}\"><b>{html.escape(best.formatted_price)} ↗</b></a>",
         ]
 
@@ -487,10 +558,18 @@ class LegoMonitorService:
                 f"<b>{best.total_price_pln:.2f} PLN</b> (<b>-{delta:.2f} PLN</b>)"
             )
 
+        if best.delivery_price_pln is None:
+            deliv_status_str = "Unknown (delivery price not specified by seller)"
+        elif best.delivery_price_pln == 0:
+            deliv_status_str = "Free delivery (0.00 PLN)"
+        else:
+            deliv_status_str = f"{best.delivery_price_pln:.2f} PLN ({best.item_price_pln:.2f} PLN + {best.delivery_price_pln:.2f} PLN)"
+
         lines.extend(
             [
                 f"📦 <b>Condition:</b> {html.escape(best.condition)}",
-                f"🚚 <b>Delivery Time:</b> {html.escape(best.delivery_time or 'Check seller page (+delivery)')}",
+                f"📬 <b>Delivery Cost:</b> {html.escape(deliv_status_str)}",
+                f"🚚 <b>Delivery Time:</b> {html.escape(best.delivery_time or 'Unknown (check seller page)')}",
                 f"🎯 <b>Your Price Range:</b> {html.escape(sub.formatted_range)}",
                 "",
                 f"📉 <b>Lowest (Last 30 Days):</b> {low_30d_line}",
@@ -501,24 +580,10 @@ class LegoMonitorService:
             ]
         )
 
-        offer_lines: list[str] = []
-        for idx, off in enumerate(top_new_offers, start=1):
-            deliv_note = (
-                f" | 🚚 {html.escape(off.delivery_time[:35])}"
-                if off.delivery_time
-                else ""
-            )
-            orig_note = (
-                f" [{off.item_price_original:.2f} {off.currency_original}]"
-                if off.currency_original.upper() != "PLN"
-                else ""
-            )
-            safe_href = html.escape(sanitize_url_for_telegram(off.url), quote=True)
-            offer_lines.append(
-                f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(off.store_name[:42])}</b></a> — "
-                f"<a href=\"{safe_href}\"><b>{html.escape(off.formatted_price)} ↗</b></a>{orig_note} "
-                f"(<i>{html.escape(off.condition)}</i>{deliv_note})"
-            )
+        offer_lines: list[str] = [
+            cls._format_single_offer_html_line(idx, off)
+            for idx, off in enumerate(top_new_offers, start=1)
+        ]
 
         # Safely fit caption within Telegram's 1024-char limit without ever slicing inside an HTML tag
         base_text = "\n".join(lines)
