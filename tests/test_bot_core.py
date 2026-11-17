@@ -74,6 +74,10 @@ def test_authenticity_and_condition_filtering() -> None:
         "Klocki - Dungeons & Dragons: Opowieść Czerwonego Smoka - jak LEGO 21348",
         set_number="21348",
     )
+    assert not is_authentic_and_complete_set(
+        "Gablota Drewlandia do zestawu LEGO 21348 - D&D: Opowieść czerwonego smoka",
+        set_number="21348",
+    )
 
     # MediaExpert installment price guard ('15,90 zł x 110 rat' vs main '1736,40 zł')
     fake_html = """

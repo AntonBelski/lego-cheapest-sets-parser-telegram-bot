@@ -1,0 +1,139 @@
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 14:18:34 UTC -> 2026-11-17 14:18:34 UTC
+OVERALL RUN STATUS : SUCCESS
+SETS SCANNED       : 0 | TOTAL OFFERS SAVED: 0 | FAILED SITES: 0
+========================================================================================
+========================================================================================
+
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 14:38:08 UTC -> 2026-11-17 14:38:08 UTC
+OVERALL RUN STATUS : SUCCESS
+SETS SCANNED       : 0 | TOTAL OFFERS SAVED: 0 | FAILED SITES: 0
+========================================================================================
+========================================================================================
+
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 15:00:40 UTC -> 2026-11-17 15:00:40 UTC
+OVERALL RUN STATUS : SUCCESS
+SETS SCANNED       : 0 | TOTAL OFFERS SAVED: 0 | FAILED SITES: 0
+========================================================================================
+========================================================================================
+
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 15:05:53 UTC -> 2026-11-17 15:05:53 UTC
+OVERALL RUN STATUS : SUCCESS
+SETS SCANNED       : 0 | TOTAL OFFERS SAVED: 0 | FAILED SITES: 0
+========================================================================================
+========================================================================================
+
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 15:10:58 UTC -> 2026-11-17 15:11:10 UTC
+OVERALL RUN STATUS : FAILED (6/13 site checks failed — valid data saved)
+SETS SCANNED       : 1 | TOTAL OFFERS SAVED: 88 | FAILED SITES: 6
+========================================================================================
+
+--- LEGO SET 21348 ---
+  [FAILED ] promoklocki.pl       | Offers: 0   | Error: HTTP 403 on https://promoklocki.pl/21348
+            ↳ URL: https://promoklocki.pl/21348
+  [SUCCESS] olx.pl               | Offers: 12 
+            ↳ URL: https://www.olx.pl/api/v1/offers/?offset=0&limit=40&query=lego%2021348&sort_by=filter_float_price%3Aasc
+            ↳ URL: https://www.olx.pl/api/v1/offers/?offset=40&limit=40&query=lego%2021348&sort_by=filter_float_price%3Aasc
+  [FAILED ] vinted.pl            | Offers: 0   | Error: Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=2&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=3&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=2&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=3&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first
+  [SUCCESS] allegrolokalnie.pl   | Offers: 5  
+            ↳ URL: https://allegrolokalnie.pl/oferty/q/lego%2021348?stan=nowe&sort=price-asc&page=1
+  [FAILED ] allegro.pl           | Offers: 0   | Error: HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=2; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1
+            ↳ URL: https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1
+            ↳ URL: https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=2
+            ↳ URL: https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1
+            ↳ URL: https://zklockow.pl/lego-21348
+  [SUCCESS] ceneo.pl             | Offers: 0  
+            ↳ URL: https://www.ceneo.pl/;szukaj-lego+21348
+  [FAILED ] ebay.pl              | Offers: 0   | Error: HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=2; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=3; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=2
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=3
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1
+  [SUCCESS] bricklink.com        | Offers: 65 
+            ↳ URL: https://www.bricklink.com/v2/catalog/catalogitem.page?S=21348-1
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=1&iconly=0
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=2&iconly=0
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=3&iconly=0
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=4&iconly=0
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=5&iconly=0
+  [SUCCESS] brickmerge.de        | Offers: 5  
+            ↳ URL: https://www.brickmerge.de/21348-1
+  [FAILED ] zklockow.pl          | Offers: 0   | Error: HTTP 403 on https://zklockow.pl/lego-21348
+            ↳ URL: https://zklockow.pl/lego-21348
+  [SUCCESS] smyk.com             | Offers: 0  
+            ↳ URL: https://www.smyk.com/pl/pl/search?q=lego%2021348
+  [FAILED ] empik.com            | Offers: 0   | Error: HTTP 403 on https://www.empik.com/szukaj/produkt?q=lego%2021348
+            ↳ URL: https://www.empik.com/szukaj/produkt?q=lego%2021348
+  [SUCCESS] mediaexpert.pl       | Offers: 1  
+            ↳ URL: https://www.mediaexpert.pl/search?query[menu_item]=&query[querystring]=lego%2021348
+
+[!] 5-MINUTE RUN MARKED AS FAILED BECAUSE AT LEAST ONE WEBSITE FAILED:
+    - Set 21348 @ promoklocki.pl: HTTP 403 on https://promoklocki.pl/21348
+    - Set 21348 @ vinted.pl: Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=2&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=3&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first
+    - Set 21348 @ allegro.pl: HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=2; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1
+    - Set 21348 @ ebay.pl: HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=2; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=3; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1
+    - Set 21348 @ zklockow.pl: HTTP 403 on https://zklockow.pl/lego-21348
+    - Set 21348 @ empik.com: HTTP 403 on https://www.empik.com/szukaj/produkt?q=lego%2021348
+    (Note: All offers from succeeded websites were preserved in the database.)
+========================================================================================
+
+========================================================================================
+5-MINUTE SCAN RUN REPORT | 2026-11-17 15:16:05 UTC -> 2026-11-17 15:16:10 UTC
+OVERALL RUN STATUS : FAILED (6/13 site checks failed — valid data saved)
+SETS SCANNED       : 1 | TOTAL OFFERS SAVED: 84 | FAILED SITES: 6
+========================================================================================
+
+--- LEGO SET 21348 ---
+  [FAILED ] promoklocki.pl       | Offers: 0   | Error: HTTP 403 on https://promoklocki.pl/21348
+            ↳ URL: https://promoklocki.pl/21348
+  [SUCCESS] olx.pl               | Offers: 8  
+            ↳ URL: https://www.olx.pl/api/v1/offers/?offset=0&limit=40&query=lego%2021348&sort_by=created_at%3Adesc
+            ↳ URL: https://www.olx.pl/api/v1/offers/?offset=0&limit=40&query=lego%2021348&sort_by=filter_float_price%3Aasc
+  [FAILED ] vinted.pl            | Offers: 0   | Error: Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first
+            ↳ URL: https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+  [SUCCESS] allegrolokalnie.pl   | Offers: 5  
+            ↳ URL: https://allegrolokalnie.pl/oferty/q/lego%2021348?stan=nowe&sort=startingTime-desc&page=1
+            ↳ URL: https://allegrolokalnie.pl/oferty/q/lego%2021348?stan=nowe&sort=price-asc&page=1
+  [FAILED ] allegro.pl           | Offers: 0   | Error: HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1
+            ↳ URL: https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1
+            ↳ URL: https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1
+            ↳ URL: https://zklockow.pl/lego-21348
+  [SUCCESS] ceneo.pl             | Offers: 0  
+            ↳ URL: https://www.ceneo.pl/;szukaj-lego+21348
+  [FAILED ] ebay.pl              | Offers: 0   | Error: HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1
+            ↳ URL: https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1
+  [SUCCESS] bricklink.com        | Offers: 65 
+            ↳ URL: https://www.bricklink.com/v2/catalog/catalogitem.page?S=21348-1
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=1&iconly=0
+            ↳ URL: https://www.bricklink.com/ajax/clone/catalogifs.ajax?itemid=237705&cond=N&comp=1&rpp=100&pg=2&iconly=0
+  [SUCCESS] brickmerge.de        | Offers: 5  
+            ↳ URL: https://www.brickmerge.de/21348-1
+  [FAILED ] zklockow.pl          | Offers: 0   | Error: HTTP 403 on https://zklockow.pl/lego-21348
+            ↳ URL: https://zklockow.pl/lego-21348
+  [SUCCESS] smyk.com             | Offers: 0  
+            ↳ URL: https://www.smyk.com/pl/pl/search?q=lego%2021348
+  [FAILED ] empik.com            | Offers: 0   | Error: HTTP 403 on https://www.empik.com/szukaj/produkt?q=lego%2021348
+            ↳ URL: https://www.empik.com/szukaj/produkt?q=lego%2021348
+  [SUCCESS] mediaexpert.pl       | Offers: 1  
+            ↳ URL: https://www.mediaexpert.pl/search?query[menu_item]=&query[querystring]=lego%2021348
+
+[!] 5-MINUTE RUN MARKED AS FAILED BECAUSE AT LEAST ONE WEBSITE FAILED:
+    - Set 21348 @ promoklocki.pl: HTTP 403 on https://promoklocki.pl/21348
+    - Set 21348 @ vinted.pl: Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=newest_first; Failed fetching https://www.vinted.pl/api/v2/catalog/items?page=1&per_page=40&search_text=lego%2021348&status_ids[]=6&status_ids[]=1&order=price_low_to_high
+    - Set 21348 @ allegro.pl: HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=n&p=1; HTTP 403 (DataDome/WAF) on https://allegro.pl/listing?string=lego%2021348&stan=nowe&order=p&p=1
+    - Set 21348 @ ebay.pl: HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1; HTTP 403 on https://www.ebay.pl/sch/i.html?_nkw=LEGO+21348&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1
+    - Set 21348 @ zklockow.pl: HTTP 403 on https://zklockow.pl/lego-21348
+    - Set 21348 @ empik.com: HTTP 403 on https://www.empik.com/szukaj/produkt?q=lego%2021348
+    (Note: All offers from succeeded websites were preserved in the database.)
+========================================================================================
+

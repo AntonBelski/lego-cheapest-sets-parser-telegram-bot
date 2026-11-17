@@ -199,16 +199,31 @@ class Database:
                 """
                 DELETE FROM price_observations
                 WHERE LOWER(title) LIKE '%jak lego%'
-                   OR LOWER(title) LIKE '%w stylu lego%';
+                   OR LOWER(title) LIKE '%w stylu lego%'
+                   OR LOWER(title) LIKE '%gablota%'
+                   OR LOWER(title) LIKE '%do zestawu lego%'
+                   OR LOWER(title) LIKE '%oświetlenie%'
+                   OR LOWER(title) LIKE '%podświetlenie%';
+                """
+            )
+            await db.execute(
+                """
+                DELETE FROM notified_offers
+                WHERE LOWER(url) LIKE '%gablota%'
+                   OR LOWER(url) LIKE '%jak-lego%';
                 """
             )
             await db.execute(
                 """
                 DELETE FROM daily_lowest_prices
-                WHERE set_number IN (SELECT set_number FROM subscriptions WHERE msrp_pln > 100)
-                  AND lowest_total_pln < (
-                      SELECT MAX(msrp_pln) * 0.18 FROM subscriptions s WHERE s.set_number = daily_lowest_prices.set_number
-                  );
+                WHERE LOWER(url) LIKE '%gablota%'
+                   OR LOWER(url) LIKE '%jak-lego%'
+                   OR (
+                       set_number IN (SELECT set_number FROM subscriptions WHERE msrp_pln > 100)
+                       AND lowest_total_pln < (
+                           SELECT MAX(msrp_pln) * 0.18 FROM subscriptions s WHERE s.set_number = daily_lowest_prices.set_number
+                       )
+                   );
                 """
             )
 
