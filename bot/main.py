@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
+import subprocess
 import sys
+from pathlib import Path
+from typing import Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 
@@ -114,8 +118,66 @@ async def run_once(check_retirement: bool = False) -> None:
             await bot.session.close()
 
 
-async def run_daemon() -> None:
-    """Run the 24/7 Telegram bot + 5-minute price scheduler + 5-day retirement scheduler."""
+async def sync_db_state_to_git() -> None:
+    """
+    Atomically commit and push `data/lego_tracker.db` and `data/scraper_runs.log`
+    to the orphan `db-state` branch using an isolated temporary git index
+    (`GIT_INDEX_FILE`), without ever touching the working directory or `main` branch.
+    """
+    db_file = Path("data/lego_tracker.db")
+    if not db_file.exists():
+        return
+
+    def _push_sync() -> None:
+        idx_path = "/tmp/lego_db_state_git_index"
+        if os.path.exists(idx_path):
+            try:
+                os.remove(idx_path)
+            except OSError:
+                pass
+        env = os.environ.copy()
+        env["GIT_INDEX_FILE"] = idx_path
+        env.setdefault("GIT_AUTHOR_NAME", "github-actions[bot]")
+        env.setdefault("GIT_AUTHOR_EMAIL", "github-actions[bot]@users.noreply.github.com")
+        env.setdefault("GIT_COMMITTER_NAME", "github-actions[bot]")
+        env.setdefault("GIT_COMMITTER_EMAIL", "github-actions[bot]@users.noreply.github.com")
+
+        files = ["data/lego_tracker.db"]
+        if Path("data/scraper_runs.log").exists():
+            files.append("data/scraper_runs.log")
+
+        subprocess.run(["git", "add", "-f", *files], env=env, check=True, capture_output=True)
+        tree_sha = subprocess.check_output(["git", "write-tree"], env=env, text=True).strip()
+        commit_sha = subprocess.check_output(
+            ["git", "commit-tree", tree_sha, "-m", "Update LEGO tracker SQLite state and run logs"],
+            env=env,
+            text=True,
+        ).strip()
+        subprocess.run(
+            ["git", "push", "-f", "origin", f"{commit_sha}:refs/heads/db-state"],
+            env=env,
+            check=True,
+            capture_output=True,
+        )
+
+    try:
+        await asyncio.to_thread(_push_sync)
+        logger.info("Synced data/lego_tracker.db & scraper_runs.log to origin/db-state.")
+    except Exception as exc:
+        logger.warning("Live git db-state sync skipped/failed: %s", exc)
+
+
+async def run_daemon(
+    duration_minutes: Optional[int] = None,
+    check_retirement: bool = False,
+    sync_git_db: bool = False,
+) -> None:
+    """
+    Run the 24/7 Telegram bot + 5-minute price scheduler + 5-day retirement scheduler.
+    If `duration_minutes` is set (e.g. on GitHub Actions continuous runner mode),
+    runs long-polling + scheduled scans for `duration_minutes` and then exits cleanly
+    so the next queued GitHub Actions workflow run takes over seamlessly.
+    """
     if not settings.telegram_bot_token or settings.telegram_bot_token == "your_telegram_bot_token_here":
         logger.error("TELEGRAM_BOT_TOKEN is not set in .env! Please configure .env first.")
         sys.exit(1)
@@ -129,10 +191,20 @@ async def run_daemon() -> None:
 
     dp = build_dispatcher(db, monitor)
 
+    async def _scheduled_price_scan() -> None:
+        await monitor.scan_all_subscribed_sets()
+        if sync_git_db:
+            await sync_db_state_to_git()
+
+    async def _scheduled_retirement_scan() -> None:
+        await monitor.check_all_retirement_dates()
+        if sync_git_db:
+            await sync_db_state_to_git()
+
     scheduler = AsyncIOScheduler()
     # 1. Every 5 minutes: check prices across all 13 Polish & EU sites
     scheduler.add_job(
-        monitor.scan_all_subscribed_sets,
+        _scheduled_price_scan,
         trigger="interval",
         minutes=settings.price_check_interval_minutes,
         id="price_scan_job",
@@ -141,7 +213,7 @@ async def run_daemon() -> None:
     )
     # 2. Every ~5 days: check retirement dates & milestone countdowns
     scheduler.add_job(
-        monitor.check_all_retirement_dates,
+        _scheduled_retirement_scan,
         trigger="interval",
         days=settings.retirement_check_interval_days,
         id="retirement_scan_job",
@@ -156,13 +228,45 @@ async def run_daemon() -> None:
     )
 
     # Trigger an initial background scan shortly after startup
-    asyncio.create_task(monitor.scan_all_subscribed_sets())
+    async def _initial_tasks() -> None:
+        await _scheduled_price_scan()
+        if check_retirement:
+            await _scheduled_retirement_scan()
+
+    init_task = asyncio.create_task(_initial_tasks())
+
+    stop_timer_task: Optional[asyncio.Task] = None
+    if duration_minutes and duration_minutes > 0:
+        async def _stop_after_duration() -> None:
+            await asyncio.sleep(duration_minutes * 60)
+            logger.info(
+                "Reached --daemon-minutes=%d window; stopping polling cleanly for next runner handoff...",
+                duration_minutes,
+            )
+            try:
+                await dp.stop_polling()
+            except Exception:
+                pass
+
+        stop_timer_task = asyncio.create_task(_stop_after_duration())
 
     try:
-        logger.info("Starting Telegram Bot long-polling...")
-        await dp.start_polling(bot)
+        logger.info(
+            "Starting Telegram Bot long-polling%s...",
+            f" (24/7 GitHub Actions window: {duration_minutes} min)" if duration_minutes else "",
+        )
+        await dp.start_polling(bot, handle_signals=duration_minutes is None)
     finally:
+        if stop_timer_task and not stop_timer_task.done():
+            stop_timer_task.cancel()
+        if not init_task.done():
+            try:
+                await asyncio.wait_for(init_task, timeout=30.0)
+            except Exception:
+                pass
         scheduler.shutdown(wait=False)
+        if sync_git_db:
+            await sync_db_state_to_git()
         await bot.session.close()
 
 
@@ -171,19 +275,36 @@ def main() -> None:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Run a single price scan cycle and exit (for GitHub Actions cron)",
+        help="Run a single price scan cycle and exit",
+    )
+    parser.add_argument(
+        "--daemon-minutes",
+        type=int,
+        default=None,
+        help="Run continuous 24/7 Telegram long-polling + 5-min scheduled scans for N minutes (for GitHub Actions)",
+    )
+    parser.add_argument(
+        "--sync-git-db",
+        action="store_true",
+        help="Live-sync data/lego_tracker.db and data/scraper_runs.log to origin/db-state after each scan",
     )
     parser.add_argument(
         "--check-retirement",
         action="store_true",
-        help="Also check retirement dates during --once run",
+        help="Also check retirement dates during startup/run",
     )
     args = parser.parse_args()
 
-    if args.once or args.check_retirement:
+    if args.once:
         asyncio.run(run_once(check_retirement=args.check_retirement))
     else:
-        asyncio.run(run_daemon())
+        asyncio.run(
+            run_daemon(
+                duration_minutes=args.daemon_minutes,
+                check_retirement=args.check_retirement,
+                sync_git_db=args.sync_git_db,
+            )
+        )
 
 
 if __name__ == "__main__":

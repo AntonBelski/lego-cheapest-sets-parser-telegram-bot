@@ -200,17 +200,35 @@ class Database:
                 DELETE FROM price_observations
                 WHERE LOWER(title) LIKE '%jak lego%'
                    OR LOWER(title) LIKE '%w stylu lego%'
+                   OR LOWER(title) LIKE '%odpowiednik%'
+                   OR LOWER(title) LIKE '%zamiennik%'
                    OR LOWER(title) LIKE '%gablota%'
                    OR LOWER(title) LIKE '%do zestawu lego%'
                    OR LOWER(title) LIKE '%oświetlenie%'
-                   OR LOWER(title) LIKE '%podświetlenie%';
+                   OR LOWER(title) LIKE '%podświetlenie%'
+                   OR LOWER(title) LIKE '%minifigur%'
+                   OR LOWER(title) LIKE '%minifigures%'
+                   OR (
+                       set_number IN (SELECT set_number FROM subscriptions WHERE msrp_pln > 100)
+                       AND total_price_pln < (
+                           SELECT MAX(msrp_pln) * 0.35 FROM subscriptions s WHERE s.set_number = price_observations.set_number
+                       )
+                   );
+                """
+            )
+            await db.execute(
+                """
+                UPDATE price_observations
+                SET url = REPLACE(REPLACE(REPLACE(url, '{', '%7B'), '}', '%7D'), '"', '%22')
+                WHERE url LIKE '%{%' OR url LIKE '%"%';
                 """
             )
             await db.execute(
                 """
                 DELETE FROM notified_offers
                 WHERE LOWER(url) LIKE '%gablota%'
-                   OR LOWER(url) LIKE '%jak-lego%';
+                   OR LOWER(url) LIKE '%jak-lego%'
+                   OR LOWER(url) LIKE '%odpowiednik%';
                 """
             )
             await db.execute(
@@ -218,10 +236,12 @@ class Database:
                 DELETE FROM daily_lowest_prices
                 WHERE LOWER(url) LIKE '%gablota%'
                    OR LOWER(url) LIKE '%jak-lego%'
+                   OR LOWER(url) LIKE '%odpowiednik%'
+                   OR LOWER(url) LIKE '%minifig%'
                    OR (
                        set_number IN (SELECT set_number FROM subscriptions WHERE msrp_pln > 100)
                        AND lowest_total_pln < (
-                           SELECT MAX(msrp_pln) * 0.18 FROM subscriptions s WHERE s.set_number = daily_lowest_prices.set_number
+                           SELECT MAX(msrp_pln) * 0.35 FROM subscriptions s WHERE s.set_number = daily_lowest_prices.set_number
                        )
                    );
                 """

@@ -61,7 +61,10 @@ class EbayScraper(BaseScraper):
 
         for url in urls_to_fetch:
             self._record_url(url)
-            status, html, _ = await http_client.get_text(url)
+            status, html, _ = await http_client.get_text(
+                url,
+                use_jina_html_on_block=False,
+            )
             if status != 200 or not html:
                 self._record_failure(f"HTTP {status} on {url}")
                 continue
@@ -78,7 +81,93 @@ class EbayScraper(BaseScraper):
 
         if any_200:
             self.last_error = None
+            return offers
+
+        # Automatic eBay Partner Index fallback (picclick.de) when direct eBay.pl blocks datacenter IPs
+        fb_ok, fb_offers = await self._fetch_via_picclick(set_number, msrp_pln)
+        if fb_ok:
+            self.last_error = None
+            return fb_offers
         return offers
+
+    async def _fetch_via_picclick(
+        self,
+        set_number: str,
+        msrp_pln: Optional[float],
+    ) -> tuple[bool, list[Offer]]:
+        url = f"https://picclick.de/?q=LEGO+{set_number}"
+        self._record_url(url)
+        status, html, _ = await http_client.get_text(
+            url,
+            use_jina_html_on_block=False,
+        )
+        if status != 200 or not html:
+            return False, []
+
+        soup = BeautifulSoup(html, "lxml")
+        cards = soup.select("ul.items li, li[id^='item-']")
+        offers: list[Offer] = []
+
+        for idx, card in enumerate(cards):
+            raw_id = str(card.get("id") or "")
+            item_id = raw_id.replace("item-", "").strip()
+            if not item_id.isdigit():
+                continue
+
+            title_el = card.select_one("h3, a[title]")
+            title = (
+                title_el.get_text(" ", strip=True)
+                if title_el
+                else card.get_text(" ", strip=True)[:120]
+            )
+            if not contains_set_number(title, set_number):
+                continue
+
+            price_el = card.select_one(".price, strong")
+            price_text = price_el.get_text(" ", strip=True) if price_el else card.get_text(" ", strip=True)
+            # Only include Buy It Now listings (skip auction-only)
+            if "buy it now" not in price_text.lower() and "sofort-kaufen" not in price_text.lower():
+                continue
+
+            orig_price = parse_price_number(price_text)
+            if not orig_price:
+                continue
+            curr = detect_currency(price_text, default="EUR")
+            item_price_pln = await currency_converter.to_pln(orig_price, curr)
+
+            if not is_authentic_and_complete_set(
+                title=title,
+                set_number=set_number,
+                msrp_pln=msrp_pln,
+                item_price_pln=item_price_pln,
+            ):
+                continue
+
+            cond = classify_condition(title=title, description=price_text)
+            if not cond:
+                continue
+
+            img_el = card.select_one("img[src]")
+            img_url = str(img_el.get("src", "")) if img_el else None
+
+            offers.append(
+                Offer(
+                    set_number=set_number,
+                    title=title[:120],
+                    source=self.source_name,
+                    store_name="eBay EU Seller (Buy It Now)",
+                    url=f"https://www.ebay.pl/itm/{item_id}",
+                    external_id=item_id,
+                    item_price_original=orig_price,
+                    currency_original=curr,
+                    item_price_pln=item_price_pln,
+                    delivery_price_pln=None,
+                    delivery_time="EU Shipping (3-7 dni)",
+                    condition=cond,
+                    image_url=img_url,
+                )
+            )
+        return True, offers
 
     async def _parse_ebay_html(
         self,

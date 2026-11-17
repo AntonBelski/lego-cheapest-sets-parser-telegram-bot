@@ -21,7 +21,10 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.db import Database
-from bot.models import format_retirement_status_and_countdown
+from bot.models import (
+    format_retirement_status_and_countdown,
+    sanitize_url_for_telegram,
+)
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import currency_converter
 from bot.services.http_client import http_client
@@ -516,9 +519,10 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             if prev_p is not None and abs(float(prev_p) - total_p) >= 1.0:
                 p_str = f"<s>{float(prev_p):.2f} PLN</s> ➔ {p_str}"
 
+            safe_href = html.escape(sanitize_url_for_telegram(str(r["url"])), quote=True)
             lines.append(
-                f"{idx}. <a href=\"{html.escape(str(r['url']))}\"><b>{html.escape(str(r['store_name']))}</b></a> — "
-                f"<b>{p_str}</b> [<i>{html.escape(str(r['condition']))}</i>]"
+                f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(str(r['store_name']))}</b></a> — "
+                f"<a href=\"{safe_href}\"><b>{p_str} ↗</b></a> [<i>{html.escape(str(r['condition']))}</i>]"
             )
 
         await msg.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
 from bot.models import Offer
-from bot.scrapers.base import BaseScraper
+from bot.scrapers.base import BaseScraper, parse_price_number
 from bot.services.currency import currency_converter
 from bot.services.filter import (
     classify_condition,
@@ -148,6 +149,85 @@ class VintedScraper(BaseScraper):
 
         if any_success:
             self.last_error = None
+            return offers
+
+        # Datacenter IP fallback (GitHub Actions Azure IPs): parse Vinted catalog via edge reader
+        fb_offers = await self._fetch_vinted_via_edge_catalog(set_number, msrp_pln)
+        if fb_offers or self.last_error is None:
+            self.last_error = None
+        return fb_offers
+
+    async def _fetch_vinted_via_edge_catalog(
+        self,
+        set_number: str,
+        msrp_pln: Optional[float],
+    ) -> list[Offer]:
+        catalog_url = (
+            f"https://www.vinted.pl/catalog?search_text=lego%20{set_number}"
+            f"&status_ids[]=6&status_ids[]=1&order=price_low_to_high"
+        )
+        edge_url = f"https://r.jina.ai/{catalog_url}"
+        self._record_url(catalog_url)
+        status, md_text, _ = await http_client.get_text(
+            edge_url,
+            use_cf_worker_on_block=False,
+            use_jina_html_on_block=False,
+            timeout=22.0,
+        )
+        if status != 200 or not md_text:
+            return []
+
+        self.last_error = None
+        offers: list[Offer] = []
+        pattern = re.compile(
+            r'\[\]\((https://www\.vinted\.pl/items/(\d+)[^\s)"]*)\s+"([^"]+)"\)'
+        )
+        seen_ids: set[str] = set()
+        for match in pattern.finditer(md_text):
+            item_url, ext_id, meta_title = match.group(1), match.group(2), match.group(3)
+            if ext_id in seen_ids:
+                continue
+            seen_ids.add(ext_id)
+            clean_url = item_url.split("?")[0]
+            title_part = meta_title.split(", Marka:")[0].split(", Stan:")[0].strip()
+            if not contains_set_number(title_part, set_number):
+                continue
+
+            prices = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", meta_title, flags=re.I)
+            if not prices:
+                continue
+            price_val = parse_price_number(prices[0])
+            if not price_val or price_val <= 0:
+                continue
+
+            if not is_authentic_and_complete_set(
+                title=meta_title,
+                set_number=set_number,
+                msrp_pln=msrp_pln,
+                item_price_pln=price_val,
+            ):
+                continue
+
+            cond = classify_condition(title=title_part, raw_condition=meta_title)
+            if not cond:
+                continue
+
+            offers.append(
+                Offer(
+                    set_number=set_number,
+                    title=title_part[:120],
+                    source=self.source_name,
+                    store_name="Vinted.pl Seller",
+                    url=clean_url,
+                    external_id=ext_id,
+                    item_price_original=price_val,
+                    currency_original="PLN",
+                    item_price_pln=price_val,
+                    delivery_price_pln=None,
+                    delivery_time="InPost / Orlen Paczka (2-4 dni)",
+                    condition=cond,
+                )
+            )
         return offers
 
     async def _fetch_vinted_items(self, api_url: str) -> tuple[bool, list[dict]]:

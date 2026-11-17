@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import base64
 import logging
 import re
 from datetime import date
 from typing import Optional
+from urllib.parse import parse_qs, unquote, urlparse
 from bs4 import BeautifulSoup
 
 from bot.models import Offer, SetMetadata
@@ -12,6 +14,35 @@ from bot.services.filter import contains_set_number, is_authentic_and_complete_s
 from bot.services.http_client import http_client
 
 logger = logging.getLogger(__name__)
+
+
+def decode_promoklocki_offer_url(href: str) -> str:
+    """
+    Decode Promoklocki's `/oferta/<base64>` or `/link/<base64>` links directly
+    to the underlying target store / Allegro URL (unwrapping affiliate redirects).
+    """
+    raw = (href or "").strip()
+    m = re.search(r"/(?:oferta|link)/([A-Za-z0-9_+=-]+)", raw)
+    if m:
+        b64 = m.group(1)
+        pad = (4 - len(b64) % 4) % 4
+        try:
+            decoded = base64.urlsafe_b64decode(b64 + ("=" * pad)).decode("utf-8", errors="ignore")
+            if decoded.startswith("http"):
+                parsed = urlparse(decoded)
+                qs = parse_qs(parsed.query)
+                for key in ("url", "ued", "murl", "dl"):
+                    if key in qs and qs[key]:
+                        inner = unquote(qs[key][0])
+                        if inner.startswith("http"):
+                            return inner
+                m_inline = re.search(r"url\((https?://[^)]+)\)", decoded)
+                if m_inline:
+                    return unquote(m_inline.group(1))
+                return decoded
+        except Exception:
+            pass
+    return raw if raw.startswith("http") else f"https://promoklocki.pl{raw}"
 
 
 class PromoklockiScraper(BaseScraper):
@@ -93,17 +124,25 @@ class PromoklockiScraper(BaseScraper):
         # 5. Parse current active store offers from Promoklocki table/rows
         offers: list[Offer] = []
         offer_rows = soup.select(
-            "table tr, .offer-row, .shop-offer, .row.align-items-center"
+            "table tr, .offer-row, .shop-offer, .row.align-items-center, div.row"
         )
+        seen_keys: set[str] = set()
         for idx, row in enumerate(offer_rows):
             row_text = row.get_text(" ", strip=True)
-            if "zł" not in row_text.lower():
+            if "zł" not in row_text.lower() or "do sklepu" not in row_text.lower():
+                continue
+            if len(row_text) > 400:
                 continue
 
-            link_el = row.select_one("a[href]")
-            if not link_el:
+            # Prefer the outbound `/link/` or `/oferta/` link over the `/sklep-...` link
+            outbound_el = (
+                row.select_one("a[href*='/link/']")
+                or row.select_one("a[href*='/oferta/']")
+                or row.select_one("a[href]")
+            )
+            if not outbound_el:
                 continue
-            href = str(link_el.get("href", "")).strip()
+            href = str(outbound_el.get("href", "")).strip()
             if not href or href.startswith("#") or "javascript:" in href:
                 continue
             # Skip internal links to OTHER sets on Promoklocki
@@ -112,9 +151,7 @@ class PromoklockiScraper(BaseScraper):
             ):
                 continue
 
-            full_url = (
-                href if href.startswith("http") else f"https://promoklocki.pl{href}"
-            )
+            full_url = decode_promoklocki_offer_url(href)
 
             price_matches = re.findall(
                 r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I
@@ -127,25 +164,36 @@ class PromoklockiScraper(BaseScraper):
 
             delivery_price: Optional[float] = None
             if re.search(
-                r"darmowa\s+dostawa|wysyłka\s+0\s*z[łl]|dostawa\s+gratis",
+                r"darmowa\s+dostawa|wysyłka\s+0\s*z[łl]|dostawa\s+gratis|allegro\s+smart",
                 row_text,
                 flags=re.I,
             ):
                 delivery_price = 0.0
-            elif len(price_matches) >= 2 and "dostaw" in row_text.lower():
-                second_p = parse_price_number(price_matches[1])
-                if second_p and second_p >= item_price:
-                    delivery_price = round(second_p - item_price, 2)
-                elif second_p and second_p < 60:
-                    delivery_price = second_p
+            else:
+                deliv_cost_m = re.search(
+                    r"koszt\s+wysyłki\s*(\d+(?:[,.]\d{1,2})?)\s*z[łl]",
+                    row_text,
+                    flags=re.I,
+                )
+                if deliv_cost_m:
+                    delivery_price = parse_price_number(deliv_cost_m.group(1))
+                elif len(price_matches) >= 2 and "dostaw" in row_text.lower():
+                    second_p = parse_price_number(price_matches[1])
+                    if second_p and second_p >= item_price:
+                        delivery_price = round(second_p - item_price, 2)
+                    elif second_p and second_p < 60:
+                        delivery_price = second_p
 
             store_name = "Promoklocki Shop"
+            shop_link = row.select_one("a[href*='/sklep-']")
             shop_img = row.select_one("img[alt]")
-            if shop_img and shop_img.get("alt"):
+            if shop_link and shop_link.get_text(strip=True):
+                store_name = f"{shop_link.get_text(strip=True)} (Promoklocki)"
+            elif shop_img and shop_img.get("alt"):
                 store_name = f"{shop_img.get('alt').strip()} (Promoklocki)"
-            elif link_el.get_text(strip=True):
-                txt = link_el.get_text(strip=True)
-                if len(txt) < 50 and "kup" not in txt.lower():
+            elif outbound_el.get_text(strip=True):
+                txt = outbound_el.get_text(strip=True)
+                if len(txt) < 50 and "kup" not in txt.lower() and "do sklepu" not in txt.lower():
                     store_name = f"{txt} (Promoklocki)"
 
             offer_title = f"LEGO {set_number} {meta.name or ''}".strip()
@@ -159,6 +207,9 @@ class PromoklockiScraper(BaseScraper):
 
             clean_store = re.sub(r"[^a-z0-9_-]", "", store_name.lower())
             ext_id = f"pk-{set_number}-{clean_store or idx}"
+            if ext_id in seen_keys:
+                continue
+            seen_keys.add(ext_id)
             offers.append(
                 Offer(
                     set_number=set_number,

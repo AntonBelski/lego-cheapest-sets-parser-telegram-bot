@@ -10,9 +10,11 @@ from bot.models import (
     ScraperSiteReport,
     Subscription,
     format_retirement_status_and_countdown,
+    sanitize_url_for_telegram,
 )
 from bot.scrapers.brickmerge import check_brickmerge_shop_ships_to_poland
 from bot.scrapers.polish_retailers import MediaExpertScraper
+from bot.scrapers.promoklocki import decode_promoklocki_offer_url
 from bot.services.chart import render_deal_card_with_chart
 from bot.services.currency import CurrencyConverter
 from bot.services.filter import (
@@ -78,6 +80,22 @@ def test_authenticity_and_condition_filtering() -> None:
         "Gablota Drewlandia do zestawu LEGO 21348 - D&D: Opowieść czerwonego smoka",
         set_number="21348",
     )
+    assert not is_authentic_and_complete_set(
+        "Dungeons & Dragons 21348 – Opowieść o Czerwonym Smoku – odpowiednik LEGO – Nowy",
+        set_number="21348",
+    )
+
+    # URL sanitization for Telegram <a href="..."> (no raw '{', '}', or '"')
+    raw_bl = 'https://store.bricklink.com/Masleeuw#/shop?o={"invID":"487937970"}'
+    safe_bl = sanitize_url_for_telegram(raw_bl)
+    assert "{" not in safe_bl and "}" not in safe_bl and '"' not in safe_bl
+    assert "%7B%22invID%22:%22487937970%22%7D" in safe_bl
+
+    # Promoklocki base64 offer URL decoding
+    decoded_alg = decode_promoklocki_offer_url(
+        "/link/aHR0cHM6Ly9jbGsudHJhZGVkb3VibGVyLmNvbS9jbGljaz9wPTI4ODM4NiZhPTIzNDc1NDEmdXJsPWh0dHBzJTNBJTJGJTJGYWxsZWdyby5wbCUyRm9mZXJ0YSUyRjE4NDE1ODA2MjU0"
+    )
+    assert decoded_alg == "https://allegro.pl/oferta/18415806254"
 
     # MediaExpert installment price guard ('15,90 zł x 110 rat' vs main '1736,40 zł')
     fake_html = """

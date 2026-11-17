@@ -240,7 +240,10 @@ class AllegroScraper(BaseScraper):
 
         for url in urls_to_fetch:
             self._record_url(url)
-            status, html, _ = await http_client.get_text(url)
+            status, html, _ = await http_client.get_text(
+                url,
+                use_jina_html_on_block=False,
+            )
             if status == 200 and html and "datadome" not in html.lower():
                 direct_200 = True
                 soup = BeautifulSoup(html, "lxml")
@@ -328,7 +331,10 @@ class AllegroScraper(BaseScraper):
         if not direct_200:
             fallback_url = f"https://zklockow.pl/lego-{set_number}"
             self._record_url(fallback_url)
-            fb_status, fb_html, _ = await http_client.get_text(fallback_url)
+            fb_status, fb_html, _ = await http_client.get_text(
+                fallback_url,
+                use_jina_html_on_block=False,
+            )
             if fb_status == 200 and fb_html:
                 self.last_error = None
                 soup = BeautifulSoup(fb_html, "lxml")
@@ -394,6 +400,51 @@ class AllegroScraper(BaseScraper):
                             condition="New (Sealed)",
                         )
                     )
+            else:
+                # 4. Datacenter IP fallback via Promoklocki decoded Allegro Smart! offer link
+                from bot.scrapers.promoklocki import decode_promoklocki_offer_url
+                pk_url = f"https://promoklocki.pl/{set_number}"
+                self._record_url(pk_url)
+                pk_status, pk_html, _ = await http_client.get_text(pk_url)
+                if pk_status == 200 and pk_html:
+                    self.last_error = None
+                    soup = BeautifulSoup(pk_html, "lxml")
+                    for idx, row in enumerate(soup.select("table tr, div.row")):
+                        row_text = row.get_text(" ", strip=True)
+                        if "allegro" not in row_text.lower() or "zł" not in row_text.lower():
+                            continue
+                        link_el = row.select_one("a[href*='/link/']") or row.select_one("a[href*='/oferta/']")
+                        if not link_el:
+                            continue
+                        decoded_url = decode_promoklocki_offer_url(str(link_el.get("href", "")))
+                        if "allegro.pl" not in decoded_url.lower():
+                            continue
+                        price_matches = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", row_text, flags=re.I)
+                        if not price_matches:
+                            continue
+                        item_price = parse_price_number(price_matches[0])
+                        if not item_price:
+                            continue
+                        deliv_p = 0.0 if ("darmowa dostawa" in row_text.lower() or "smart" in row_text.lower()) else None
+                        m_id = re.search(r"/oferta/(\d+)", decoded_url)
+                        ext_id = m_id.group(1) if m_id else f"alg-pk-{set_number}"
+                        offers.append(
+                            Offer(
+                                set_number=set_number,
+                                title=f"LEGO {set_number} (Allegro Smart!)",
+                                source=self.source_name,
+                                store_name="Allegro.pl (Smart! Offer)",
+                                url=decoded_url,
+                                external_id=ext_id,
+                                item_price_original=item_price,
+                                currency_original="PLN",
+                                item_price_pln=item_price,
+                                delivery_price_pln=deliv_p,
+                                delivery_time="1-2 dni robocze (Allegro Smart!)",
+                                condition="New (Sealed)",
+                            )
+                        )
+                        break
 
         return offers
 

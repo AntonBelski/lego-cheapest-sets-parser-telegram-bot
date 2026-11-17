@@ -4,6 +4,31 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
+from urllib.parse import quote, urlsplit, urlunsplit
+
+
+def sanitize_url_for_telegram(url: str) -> str:
+    """
+    Ensure a URL is strictly RFC-3986 compliant for Telegram HTML `<a href="...">` links.
+    Telegram's server-side HTML entity parser silently strips `<a href="...">` tags if the
+    URL contains unencoded characters like `{`, `}`, `"`, spaces, `[`, `]`, or `|`.
+    """
+    raw = (url or "").strip()
+    if not raw.startswith(("http://", "https://")):
+        return raw
+    try:
+        parts = urlsplit(raw)
+        safe_path = quote(parts.path, safe="/:@!$&'()*+,;=-._~%")
+        safe_query = quote(parts.query, safe="?=&/:@!$'()*+,;-._~%")
+        safe_fragment = quote(parts.fragment, safe="?=&/:@!$'()*+,;-._~%")
+        return urlunsplit((parts.scheme, parts.netloc, safe_path, safe_query, safe_fragment))
+    except Exception:
+        return (
+            raw.replace(" ", "%20")
+            .replace('"', "%22")
+            .replace("{", "%7B")
+            .replace("}", "%7D")
+        )
 
 
 def format_retirement_status_and_countdown(
@@ -91,6 +116,9 @@ class Offer:
     image_url: Optional[str] = None
     previous_price_pln: Optional[float] = None  # Populated when a listing's price changed
     found_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        self.url = sanitize_url_for_telegram(self.url)
 
     @property
     def delivery_known(self) -> bool:

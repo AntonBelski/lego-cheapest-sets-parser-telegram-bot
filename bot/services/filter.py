@@ -39,6 +39,8 @@ REPLICA_KEYWORDS: tuple[str, ...] = (
     "wzór lego",
     "nieoryginalne",
     "klon lego",
+    "odpowiednik",
+    "zamiennik",
     "custom moc",
     "aliexpress",
 )
@@ -67,6 +69,11 @@ PARTIAL_OR_ACCESSORY_KEYWORDS: tuple[str, ...] = (
     "tylko figurki",
     "minifigurki z zestawu",
     "minifigurka z zestawu",
+    "lego minifigures",
+    "lego minifigure",
+    "minifigures ",
+    "minifigurki ",
+    "minifigurka ",
     "oświetlenie led",
     "oświetlenie do",
     "podświetlenie",
@@ -182,9 +189,9 @@ def is_authentic_and_complete_set(
         if kw in combined:
             return False
 
-    # Sanity check against tiny accessories/manuals slipping through when MSRP is known
+    # Sanity check against tiny accessories/manuals/minifig lots slipping through when MSRP is known
     if msrp_pln and msrp_pln > 100 and item_price_pln is not None:
-        if item_price_pln < (msrp_pln * 0.18):
+        if item_price_pln < (msrp_pln * 0.35):
             return False
 
     return True

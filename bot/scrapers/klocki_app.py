@@ -32,8 +32,38 @@ class KlockiAppScraper(BaseScraper):
     ) -> list[Offer]:
         url = f"https://zklockow.pl/lego-{set_number}"
         self._record_url(url)
-        status, html, _ = await http_client.get_text(url)
+        status, html, _ = await http_client.get_text(
+            url,
+            use_jina_html_on_block=False,
+        )
         if status != 200 or not html:
+            # Datacenter IP fallback: extract partner Polish store offers via Promoklocki edge relay
+            from bot.scrapers.promoklocki import PromoklockiScraper
+            pk = PromoklockiScraper()
+            _, pk_offers, _ = await pk.fetch_metadata_and_history(set_number)
+            if pk.last_error is None:
+                self.last_error = None
+                fallback_offers: list[Offer] = []
+                for off in pk_offers:
+                    clean_s = off.store_name.replace(" (Promoklocki)", "")
+                    fallback_offers.append(
+                        Offer(
+                            set_number=off.set_number,
+                            title=off.title,
+                            source=self.source_name,
+                            store_name=f"{clean_s} (PL Store)",
+                            url=off.url,
+                            external_id=f"zk-{off.external_id}",
+                            item_price_original=off.item_price_original,
+                            currency_original=off.currency_original,
+                            item_price_pln=off.item_price_pln,
+                            delivery_price_pln=off.delivery_price_pln,
+                            delivery_time=off.delivery_time,
+                            condition=off.condition,
+                            image_url=off.image_url,
+                        )
+                    )
+                return fallback_offers
             self._record_failure(f"HTTP {status} on {url}")
             return []
 

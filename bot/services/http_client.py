@@ -94,6 +94,7 @@ class AntiBlockHttpClient:
         headers: dict[str, str] | None = None,
         timeout: float = 18.0,
         use_cf_worker_on_block: bool = True,
+        use_jina_html_on_block: bool = True,
     ) -> tuple[int, str, dict[str, str]]:
         """
         Perform a GET request with TLS fingerprint impersonation and domain jitter.
@@ -108,9 +109,9 @@ class AntiBlockHttpClient:
 
         status, text, resp_headers = await self._execute_get(target_url, req_headers, proxy, timeout)
 
-        # If blocked (403/429/503) and Cloudflare Worker relay is configured, retry through Worker
+        # 1. If blocked (403/429/503) and Cloudflare Worker relay is configured, retry through Worker
         if (
-            status in (403, 429, 503)
+            status in (0, 403, 429, 503)
             and use_cf_worker_on_block
             and settings.cf_worker_proxy_url
         ):
@@ -118,6 +119,23 @@ class AntiBlockHttpClient:
             cf_url, cf_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=True)
             self.total_requests_made += 1
             status, text, resp_headers = await self._execute_get(cf_url, cf_headers, proxy, timeout)
+
+        # 2. Built-in zero-config edge HTML relay fallback for datacenter IPs (GitHub Actions Azure IPs)
+        if (
+            status in (0, 403, 429, 503)
+            and use_jina_html_on_block
+            and not url.startswith("https://r.jina.ai/")
+        ):
+            jina_url = f"https://r.jina.ai/{url}"
+            jina_headers = {
+                "User-Agent": random.choice(USER_AGENTS),
+                "X-Return-Format": "html",
+            }
+            logger.info("Retrying %s via edge HTML relay (initial status %d)", domain, status)
+            self.total_requests_made += 1
+            j_status, j_text, j_hdrs = await self._execute_get(jina_url, jina_headers, proxy, timeout=22.0)
+            if j_status == 200 and j_text and len(j_text) > 1200 and "403 Forbidden" not in j_text[:400]:
+                return 200, j_text, j_hdrs
 
         return status, text, resp_headers
 

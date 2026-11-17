@@ -120,7 +120,10 @@ class BricklinkScraper(BaseScraper):
                         continue
 
                     store_name = str(
-                        row.get("strStoreName") or "BrickLink Store"
+                        row.get("strStorename")
+                        or row.get("strStoreName")
+                        or row.get("strSellerUsername")
+                        or "Store"
                     ).strip()
                     seller_country = str(
                         row.get("strSellerCountryName")
@@ -131,8 +134,9 @@ class BricklinkScraper(BaseScraper):
                     store_username = str(
                         row.get("strSellerUsername") or ""
                     ).strip()
+                    from urllib.parse import quote
                     buy_url = (
-                        f"https://store.bricklink.com/{store_username}#/shop?o={{\"invID\":\"{lot_id}\"}}"
+                        f"https://store.bricklink.com/{quote(store_username, safe='')}#/shop?o=%7B%22invID%22%3A%22{lot_id}%22%7D"
                         if store_username
                         else catalog_url
                     )
@@ -144,9 +148,9 @@ class BricklinkScraper(BaseScraper):
                             if desc
                             else f"LEGO {set_number} ({code_complete})",
                             source=self.source_name,
-                            store_name=f"{store_name} ({seller_country})"
+                            store_name=f"BrickLink: {store_name} ({seller_country})"
                             if seller_country
-                            else store_name,
+                            else f"BrickLink: {store_name}",
                             url=buy_url,
                             external_id=lot_id,
                             item_price_original=orig_price,

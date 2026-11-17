@@ -19,6 +19,7 @@ from bot.models import (
     SetMetadata,
     Subscription,
     format_retirement_status_and_countdown,
+    sanitize_url_for_telegram,
 )
 from bot.scrapers.allegro import AllegroLokalnieScraper, AllegroScraper
 from bot.scrapers.base import BaseScraper
@@ -467,12 +468,13 @@ class LegoMonitorService:
             else f"🔥 <b>NEW LOW PRICE IN YOUR RANGE: LEGO {html.escape(sub.set_number)}</b>"
         )
 
+        best_href = html.escape(sanitize_url_for_telegram(best.url), quote=True)
         lines = [
             header_title,
             f"🧱 <b>{set_title}</b>",
             "",
             f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_line}",
-            f"💰 <b>Current Best Price:</b> <b>{html.escape(best.formatted_price)}</b>",
+            f"💰 <b>Current Best Price:</b> <a href=\"{best_href}\"><b>{html.escape(best.formatted_price)} ↗</b></a>",
         ]
 
         if (
@@ -511,9 +513,10 @@ class LegoMonitorService:
                 if off.currency_original.upper() != "PLN"
                 else ""
             )
+            safe_href = html.escape(sanitize_url_for_telegram(off.url), quote=True)
             offer_lines.append(
-                f"{idx}. <a href=\"{html.escape(off.url, quote=True)}\"><b>{html.escape(off.store_name[:45])}</b></a> — "
-                f"<b>{html.escape(off.formatted_price)}</b>{orig_note} "
+                f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(off.store_name[:42])}</b></a> — "
+                f"<a href=\"{safe_href}\"><b>{html.escape(off.formatted_price)} ↗</b></a>{orig_note} "
                 f"(<i>{html.escape(off.condition)}</i>{deliv_note})"
             )
 
