@@ -254,8 +254,9 @@ async def run_daemon(
             duration_minutes,
         )
 
-    # Trigger an initial background scan shortly after startup
+    # Trigger an initial background scan shortly after startup so dp.start_polling() completes bot.get_me() first
     async def _initial_tasks() -> None:
+        await asyncio.sleep(2.0)
         await _scheduled_price_scan()
         if check_retirement:
             await _scheduled_retirement_scan()
@@ -265,19 +266,27 @@ async def run_daemon(
     stop_timer_task: Optional[asyncio.Task] = None
     if duration_minutes and duration_minutes > 0:
         async def _stop_after_duration() -> None:
-            # Stop 15 seconds before the 5-minute interval boundary so we never collide with a new scan tick
             sleep_sec = max(30, duration_minutes * 60 - 15)
             await asyncio.sleep(sleep_sec)
             logger.info(
-                "Reached --daemon-minutes=%d window; waiting for active scan (if any) and stopping polling cleanly...",
+                "Reached --daemon-minutes=%d window; stopping polling cleanly...",
                 duration_minutes,
             )
-            scheduler.shutdown(wait=False)
-            async with scan_lock:
-                try:
-                    await dp.stop_polling()
-                except Exception:
-                    pass
+            try:
+                if scheduler.running:
+                    scheduler.shutdown(wait=False)
+            except Exception as exc:
+                logger.debug("Scheduler shutdown note: %s", exc)
+            try:
+                await asyncio.wait_for(asyncio.shield(scan_lock.acquire()), timeout=20.0)
+                if scan_lock.locked():
+                    scan_lock.release()
+            except Exception:
+                pass
+            try:
+                await dp.stop_polling()
+            except Exception as exc:
+                logger.debug("dp.stop_polling note: %s", exc)
 
         stop_timer_task = asyncio.create_task(_stop_after_duration())
 
@@ -286,7 +295,14 @@ async def run_daemon(
             "Starting Telegram Bot long-polling%s...",
             f" (24/7 GitHub Actions window: {duration_minutes} min)" if duration_minutes else "",
         )
-        await dp.start_polling(bot, handle_signals=duration_minutes is None)
+        polling_coro = dp.start_polling(bot, handle_signals=duration_minutes is None)
+        if duration_minutes and duration_minutes > 0:
+            try:
+                await asyncio.wait_for(polling_coro, timeout=duration_minutes * 60)
+            except asyncio.TimeoutError:
+                logger.info("Polling window (%d min) reached via hard timeout; exiting cleanly.", duration_minutes)
+        else:
+            await polling_coro
     finally:
         if stop_timer_task and not stop_timer_task.done():
             stop_timer_task.cancel()
@@ -295,8 +311,11 @@ async def run_daemon(
                 await asyncio.wait_for(init_task, timeout=45.0)
             except Exception:
                 pass
-        if scheduler.running:
-            scheduler.shutdown(wait=False)
+        try:
+            if scheduler.running:
+                scheduler.shutdown(wait=False)
+        except Exception:
+            pass
         if sync_git_db:
             await sync_db_state_to_git()
         print(http_client.format_api_calls_summary(), flush=True)

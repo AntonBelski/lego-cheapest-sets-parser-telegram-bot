@@ -24,6 +24,7 @@ from bot.db import Database
 from bot.keyboards import main_menu_keyboard, set_actions_keyboard
 from bot.models import (
     format_retirement_status_and_countdown,
+    format_short_store_label,
     format_source_label,
     sanitize_url_for_telegram,
 )
@@ -502,22 +503,27 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             total_p = float(r["total_price_pln"])
             prev_p = r.get("previous_price_pln")
             deliv_known = bool(r["delivery_known"])
+            deliv_is_est = bool(r.get("delivery_is_estimated"))
             deliv_p = r["delivery_price_pln"]
+            item_p = float(r.get("item_price_pln") or round(total_p - float(deliv_p or 0), 2))
+
             if not deliv_known or deliv_p is None:
-                p_str = f"{total_p:.2f} PLN (delivery price unknown)"
+                deliv_part = "delivery unknown"
             elif float(deliv_p) == 0:
-                p_str = f"{total_p:.2f} PLN (free delivery)"
+                deliv_part = "free delivery"
+            elif deliv_is_est:
+                deliv_part = f"{item_p:.2f} PLN + <b>{float(deliv_p):.2f} PLN est. EU delivery</b>"
             else:
-                item_p = float(r.get("item_price_pln") or round(total_p - float(deliv_p), 2))
-                p_str = f"{total_p:.2f} PLN ({item_p:.2f} PLN + {float(deliv_p):.2f} PLN delivery)"
+                deliv_part = f"{item_p:.2f} PLN + {float(deliv_p):.2f} PLN delivery"
 
+            price_badge = f"{total_p:.2f} PLN"
             if prev_p is not None and abs(float(prev_p) - total_p) >= 1.0:
-                p_str = f"<s>{float(prev_p):.2f} PLN</s> ➔ {p_str}"
+                price_badge = f"<s>{float(prev_p):.2f} PLN</s> ➔ {price_badge}"
 
+            store_lbl = format_short_store_label(str(r.get("source") or ""), str(r.get("store_name") or ""))
             safe_href = html.escape(sanitize_url_for_telegram(str(r["url"])), quote=True)
             lines.append(
-                f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(str(r['store_name']))}</b></a> — "
-                f"<a href=\"{safe_href}\"><b>{p_str} ↗</b></a> [<i>{html.escape(str(r['condition']))}</i>]"
+                f'{idx}. <a href="{safe_href}"><b>{html.escape(store_lbl)} - {price_badge}</b></a> ({deliv_part})'
             )
 
         await msg.answer(

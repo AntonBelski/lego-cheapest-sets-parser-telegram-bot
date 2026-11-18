@@ -66,8 +66,8 @@ class LegoMonitorService:
             AllegroLokalnieScraper(),
             AllegroScraper(),
             CeneoScraper(),
-            EbayScraper(),
-            BricklinkScraper(),
+            # EbayScraper(),       # Temporarily disabled per user request
+            # BricklinkScraper(),  # Temporarily disabled per user request
             BrickmergeScraper(),
             KlockiAppScraper(),  # zklockow.pl
             SmykScraper(),
@@ -419,8 +419,8 @@ class LegoMonitorService:
 
         best_offer = unnotified[0]
         top_batch = unnotified[:20]
-        caption = self.format_deal_notification_caption(
-            sub, best_offer, top_batch[:3], stats
+        caption, overflow_offers = self.split_caption_and_overflow_offers(
+            sub, best_offer, top_batch, stats
         )
 
         try:
@@ -449,8 +449,8 @@ class LegoMonitorService:
                         disable_web_page_preview=True,
                         reply_markup=main_menu_keyboard(),
                     )
-                # If there are multiple new offers (up to 20), send all of them in a single message
-                if len(top_batch) > 1:
+                # Send a second text-only message ONLY when offers didn't all fit inside the photo caption
+                if overflow_offers:
                     batch_text = self.format_full_offers_batch_message(sub, top_batch)
                     await self.bot.send_message(
                         chat_id=sub.chat_id,
@@ -472,21 +472,27 @@ class LegoMonitorService:
 
     @staticmethod
     def _format_single_offer_html_line(idx: int, off: Offer) -> str:
-        deliv_note = (
-            f" | 🚚 {html.escape(off.delivery_time[:35])}"
-            if off.delivery_time
-            else ""
-        )
-        orig_note = (
-            f" [{off.item_price_original:.2f} {off.currency_original}]"
+        if off.delivery_is_estimated and off.delivery_price_pln:
+            deliv_part = (
+                f"{off.item_price_pln:.2f} PLN + "
+                f"<b>{off.delivery_price_pln:.2f} PLN est. EU delivery</b>"
+            )
+        elif off.delivery_price_pln is None:
+            deliv_part = "delivery unknown"
+        elif off.delivery_price_pln == 0:
+            deliv_part = "free delivery"
+        else:
+            deliv_part = f"{off.item_price_pln:.2f} PLN + {off.delivery_price_pln:.2f} PLN delivery"
+
+        orig_part = (
+            f" [{off.item_price_original:.2f} {off.currency_original.upper()}]"
             if off.currency_original.upper() != "PLN"
             else ""
         )
         safe_href = html.escape(sanitize_url_for_telegram(off.url), quote=True)
         return (
-            f"{idx}. <a href=\"{safe_href}\"><b>{html.escape(off.store_name[:42])}</b></a> — "
-            f"<a href=\"{safe_href}\"><b>{html.escape(off.formatted_price)} ↗</b></a>{orig_note} "
-            f"(<i>{html.escape(off.condition)}</i>{deliv_note})"
+            f'{idx}. <a href="{safe_href}"><b>{html.escape(off.short_store_label)} - {off.total_price_pln:.2f} PLN</b></a> '
+            f"({deliv_part}{html.escape(orig_part)})"
         )
 
     @classmethod
@@ -510,13 +516,11 @@ class LegoMonitorService:
         return "\n".join(output_lines)
 
     @classmethod
-    def format_deal_notification_caption(
+    def _build_base_caption_lines(
         cls,
         sub: Subscription,
         best: Offer,
-        top_new_offers: list[Offer],
-        stats: PriceStats,
-    ) -> str:
+    ) -> list[str]:
         raw_name = (sub.set_name or best.title or f"Set {sub.set_number}").strip()
         raw_name = re.sub(
             rf"^LEGO\s*®?\s*(?:Ideas\s+|Star Wars\s+|Technic\s+|Icons\s+|Creator\s+|City\s+|Marvel\s+|Harry Potter\s+|Ninjago\s+)?{re.escape(sub.set_number)}\s*[-–:]?\s*",
@@ -528,39 +532,90 @@ class LegoMonitorService:
 
         msrp_str = f"{sub.msrp_pln:.2f} PLN" if (sub.msrp_pln and sub.msrp_pln > 0) else "N/A"
 
-        detail_parts: list[str] = []
-        if best.delivery_price_pln is None:
-            detail_parts.append("delivery price unknown")
+        detail_parts_html: list[str] = []
+        if best.delivery_is_estimated and best.delivery_price_pln:
+            detail_parts_html.append(
+                f"{best.item_price_pln:.2f} PLN + <b>{best.delivery_price_pln:.2f} PLN estimated EU delivery</b>"
+            )
+        elif best.delivery_price_pln is None:
+            detail_parts_html.append("delivery price unknown")
         elif best.delivery_price_pln == 0:
-            detail_parts.append("free delivery")
+            detail_parts_html.append("free delivery")
         else:
-            detail_parts.append(
+            detail_parts_html.append(
                 f"{best.item_price_pln:.2f} PLN + {best.delivery_price_pln:.2f} PLN delivery"
             )
 
         if sub.msrp_pln and sub.msrp_pln > 0:
             diff_pct = ((sub.msrp_pln - best.total_price_pln) / sub.msrp_pln) * 100
             if diff_pct > 0:
-                detail_parts.append(f"-{diff_pct:.1f}% vs LEGO MSRP")
+                detail_parts_html.append(f"-{diff_pct:.1f}% vs LEGO MSRP")
             else:
-                detail_parts.append(f"+{abs(diff_pct):.1f}% vs LEGO MSRP")
+                detail_parts_html.append(f"+{abs(diff_pct):.1f}% vs LEGO MSRP")
 
-        details_str = ", ".join(detail_parts)
+        details_html = ", ".join(detail_parts_html)
         best_href = html.escape(sanitize_url_for_telegram(best.url), quote=True)
-        store_link = f'<a href="{best_href}"><b>{html.escape(best.store_name)}</b></a>'
+        store_link = f'<a href="{best_href}"><b>{html.escape(best.short_store_label)} - {best.total_price_pln:.2f} PLN</b></a>'
 
         ret_line = format_retirement_status_and_countdown(sub.retirement_date, None)
 
-        lines = [
+        return [
             f"<b>LEGO {html.escape(sub.set_number)} - {set_title}</b>",
             f"Official LEGO Catalog Price: <b>{msrp_str}</b>",
-            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({html.escape(details_str)})",
+            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({details_html})",
             store_link,
             "",
             f"Your Price Range: <b>{html.escape(sub.formatted_range)}</b>",
             f"Retirement Status: {html.escape(ret_line)}",
         ]
-        return "\n".join(lines)[:1000]
+
+    @classmethod
+    def split_caption_and_overflow_offers(
+        cls,
+        sub: Subscription,
+        best: Offer,
+        top_new_offers: list[Offer],
+        stats: PriceStats,
+    ) -> tuple[str, list[Offer]]:
+        base_lines = cls._build_base_caption_lines(sub, best)
+        base_text = "\n".join(base_lines)
+
+        if len(top_new_offers) <= 1:
+            return base_text[:1000], []
+
+        section_header = "\n\n🛒 <b>New / Price-Dropped Offers:</b>"
+        offer_lines = [
+            cls._format_single_offer_html_line(idx, off)
+            for idx, off in enumerate(top_new_offers[:20], start=1)
+        ]
+
+        # Check if ALL offers fit inside Telegram's 1024-char photo caption
+        full_candidate = base_text + section_header + "\n" + "\n".join(offer_lines)
+        full_visible = re.sub(r"<[^>]+>", "", full_candidate)
+        if len(full_visible) <= 1000 and len(full_candidate) <= 3800:
+            return full_candidate, []
+
+        # Otherwise fit as many lines as safely fit in caption and overflow the full batch to message #2
+        fitted_caption = base_text
+        for keep_count in range(len(offer_lines) - 1, 0, -1):
+            cand = base_text + section_header + "\n" + "\n".join(offer_lines[:keep_count])
+            vis = re.sub(r"<[^>]+>", "", cand)
+            if len(vis) <= 1000 and len(cand) <= 3800:
+                fitted_caption = cand
+                break
+
+        return fitted_caption, list(top_new_offers[:20])
+
+    @classmethod
+    def format_deal_notification_caption(
+        cls,
+        sub: Subscription,
+        best: Offer,
+        top_new_offers: list[Offer],
+        stats: PriceStats,
+    ) -> str:
+        caption, _ = cls.split_caption_and_overflow_offers(sub, best, top_new_offers, stats)
+        return caption
 
     # -------------------------------------------------------------------------
     # Retirement Date Checking (Every ~5 days)

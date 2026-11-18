@@ -17,16 +17,51 @@ from bot.services.http_client import http_client
 
 logger = logging.getLogger(__name__)
 
+# Average tracked courier delivery cost to Poland for LEGO sets from personal sellers:
+# - ~15 EUR (~65 PLN) for DHL Paket / DPD / GLS across the EU
+# - ~18 PLN for InPost / courier within Poland
+ESTIMATED_EU_DELIVERY_PLN = 65.0
+ESTIMATED_PL_DELIVERY_PLN = 18.0
+
+EU_COUNTRIES: set[str] = {
+    "austria", "at",
+    "belgium", "be",
+    "bulgaria", "bg",
+    "croatia", "hr",
+    "cyprus", "cy",
+    "czech republic", "czechia", "cz",
+    "denmark", "dk",
+    "estonia", "ee",
+    "finland", "fi",
+    "france", "fr",
+    "germany", "de",
+    "greece", "gr",
+    "hungary", "hu",
+    "ireland", "ie",
+    "italy", "it",
+    "latvia", "lv",
+    "lithuania", "lt",
+    "luxembourg", "lu",
+    "malta", "mt",
+    "netherlands", "nl",
+    "poland", "pl",
+    "portugal", "pt",
+    "romania", "ro",
+    "slovakia", "sk",
+    "slovenia", "si",
+    "spain", "es",
+    "sweden", "se",
+}
+
 
 class BricklinkScraper(BaseScraper):
     """
     Parser for bricklink.com for a specific LEGO set (`S={set_number}-1`):
     1) Resolves BrickLink internal item ID (`idItem`) from the set catalog page.
-    2) Paginates through BrickLink's `catalogifs.ajax` JSON endpoint (`rpp=100&pg=1..N`)
-       for New (`N`) & Complete/Sealed (`C`/`S`) sets so sets with >100 listings
-       are never truncated by pagination!
+    2) Paginates through BrickLink's `catalogifs.ajax` JSON endpoint (`reg=-1` EU only,
+       `cond=N&ii=0&ic=0`, `rpp=100&pi=1..N`).
     3) Converts store prices from EUR/USD/GBP/PLN to PLN via real-time NBP rates.
-    4) Explicitly marks `delivery_price_pln=None` so it displays `(+delivery)`.
+    4) Adds estimated EU/PL delivery cost (`delivery_is_estimated=True`).
     """
 
     source_name = "bricklink.com"
@@ -87,10 +122,10 @@ class BricklinkScraper(BaseScraper):
         if item_id:
             max_pages = 5
             for page in range(1, max_pages + 1):
-                # Filter: cond=N (New), ii=0 (no incomplete), ic=0 (complete/sealed only), iconly=0, pi={page}
+                # Filter: cond=N (New), ii=0 (no incomplete), ic=0 (complete/sealed only), reg=-1 (European Union), iconly=0, pi={page}
                 ajax_url = (
                     f"https://www.bricklink.com/ajax/clone/catalogifs.ajax"
-                    f"?itemid={item_id}&cond=N&ii=0&ic=0&iconly=0&rpp=100&pi={page}"
+                    f"?itemid={item_id}&cond=N&ii=0&ic=0&reg=-1&iconly=0&rpp=100&pi={page}"
                 )
                 self._record_url(ajax_url)
                 ajax_status, payload = await http_client.get_json(
@@ -111,6 +146,18 @@ class BricklinkScraper(BaseScraper):
                         continue
                     code_complete = str(row.get("codeComplete", "C")).upper()
                     if code_complete not in ("C", "S"):
+                        continue
+
+                    seller_country = str(
+                        row.get("strSellerCountryName")
+                        or row.get("strSellerCountryCode")
+                        or ""
+                    ).strip()
+                    seller_country_code = str(row.get("strSellerCountryCode") or "").strip().lower()
+                    if (
+                        seller_country.lower() not in EU_COUNTRIES
+                        and seller_country_code not in EU_COUNTRIES
+                    ):
                         continue
 
                     desc = str(row.get("strDesc", "")).strip()
@@ -137,11 +184,6 @@ class BricklinkScraper(BaseScraper):
                         or row.get("strSellerUsername")
                         or "Store"
                     ).strip()
-                    seller_country = str(
-                        row.get("strSellerCountryName")
-                        or row.get("strSellerCountryCode")
-                        or ""
-                    ).strip()
                     lot_id = str(row.get("idInv") or f"bl-{page}-{idx}")
                     store_username = str(
                         row.get("strSellerUsername") or ""
@@ -151,6 +193,12 @@ class BricklinkScraper(BaseScraper):
                         f"https://store.bricklink.com/{quote(store_username, safe='')}#/shop?o=%7B%22invID%22%3A%22{lot_id}%22%7D"
                         if store_username
                         else catalog_url
+                    )
+
+                    est_deliv = (
+                        ESTIMATED_PL_DELIVERY_PLN
+                        if seller_country.lower() in ("poland", "pl") or seller_country_code == "pl"
+                        else ESTIMATED_EU_DELIVERY_PLN
                     )
 
                     offers.append(
@@ -168,10 +216,11 @@ class BricklinkScraper(BaseScraper):
                             item_price_original=orig_price,
                             currency_original=curr,
                             item_price_pln=item_price_pln,
-                            delivery_price_pln=None,
+                            delivery_price_pln=est_deliv,
+                            delivery_is_estimated=True,
                             delivery_time=f"Ships from {seller_country}"
                             if seller_country
-                            else "BrickLink Seller",
+                            else "BrickLink Seller (EU)",
                             condition=cond,
                             image_url=f"https://img.bricklink.com/ItemImage/SN/0/{set_number}-1.png",
                         )

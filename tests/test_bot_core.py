@@ -359,3 +359,95 @@ def test_caption_html_never_truncates_mid_tag() -> None:
     assert caption.count("<i>") == caption.count("</i>")
     visible = re.sub(r"<[^>]+>", "", caption)
     assert len(visible) <= 1024
+
+
+def test_vinted_fee_eu_filters_concise_line_and_merged_notification() -> None:
+    from bot.models import PriceStats
+    from bot.scrapers.bricklink import EU_COUNTRIES
+    from bot.scrapers.ebay import _is_non_eu_listing
+    from bot.scrapers.vinted import apply_vinted_buyer_protection_fee
+
+    # 1. Vinted fee formula (283.06 -> 300.11 PLN)
+    assert apply_vinted_buyer_protection_fee(283.06) == 300.11
+
+    # 2. EU-only filters
+    assert "germany" in EU_COUNTRIES and "de" in EU_COUNTRIES
+    assert "poland" in EU_COUNTRIES and "pl" in EU_COUNTRIES
+    assert "usa" not in EU_COUNTRIES and "us" not in EU_COUNTRIES
+    assert _is_non_eu_listing("Ships from United States", "USD") is True
+    assert _is_non_eu_listing("Ships from Canada", "CAD") is True
+    assert _is_non_eu_listing("Versand aus Deutschland", "EUR") is False
+
+    # 3. Concise offer line format with estimated EU delivery highlighted in bold
+    bl_offer = Offer(
+        set_number="76429",
+        title="LEGO 76429 Talking Sorting Hat",
+        source="bricklink.com",
+        store_name="BrickLink: Brickcr8tor Extras (Germany)",
+        url='https://store.bricklink.com/Brickcr8tor#/shop?o={"invID":"542333054"}',
+        external_id="542333054",
+        item_price_original=64.00,
+        currency_original="USD",
+        item_price_pln=256.14,
+        delivery_price_pln=65.0,
+        delivery_is_estimated=True,
+    )
+    line = LegoMonitorService._format_single_offer_html_line(1, bl_offer)
+    assert "<b>BrickLink - 321.14 PLN</b>" in line
+    assert "256.14 PLN + <b>65.00 PLN est. EU delivery</b> [64.00 USD]" in line
+
+    # 4. Single merged notification caption (no overflow when few offers fit)
+    sub = Subscription(
+        id=1,
+        chat_id=196462642,
+        set_number="76429",
+        price_from=250.0,
+        price_to=350.0,
+        set_name="Talking Sorting Hat",
+        msrp_pln=419.99,
+        retirement_date="2026-07-31",
+    )
+    stats = PriceStats(set_number="76429")
+    small_offers = [
+        Offer(
+            set_number="76429",
+            title="LEGO 76429",
+            source="vinted.pl",
+            store_name="Vinted.pl Seller",
+            url=f"https://www.vinted.pl/items/{i}",
+            external_id=str(i),
+            item_price_original=300.11 + i,
+            currency_original="PLN",
+            item_price_pln=300.11 + i,
+            delivery_price_pln=None,
+        )
+        for i in range(3)
+    ]
+    cap_small, overflow_small = LegoMonitorService.split_caption_and_overflow_offers(
+        sub, small_offers[0], small_offers, stats
+    )
+    assert overflow_small == []
+    assert "New / Price-Dropped Offers:" in cap_small
+
+    # When 20 offers exceed 1024 visible chars, overflow triggers message #2
+    many_offers = [
+        Offer(
+            set_number="76429",
+            title="LEGO 76429",
+            source="vinted.pl",
+            store_name="Vinted.pl Seller",
+            url=f"https://www.vinted.pl/items/{i}",
+            external_id=str(i),
+            item_price_original=300.11 + i,
+            currency_original="PLN",
+            item_price_pln=300.11 + i,
+            delivery_price_pln=None,
+        )
+        for i in range(20)
+    ]
+    cap_many, overflow_many = LegoMonitorService.split_caption_and_overflow_offers(
+        sub, many_offers[0], many_offers, stats
+    )
+    assert len(overflow_many) == 20
+    import re
+    assert len(re.sub(r"<[^>]+>", "", cap_many)) <= 1024

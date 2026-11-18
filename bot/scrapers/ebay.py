@@ -17,15 +17,47 @@ from bot.services.http_client import http_client
 
 logger = logging.getLogger(__name__)
 
+# Average tracked EU cross-border parcel shipping for LEGO sets to Poland (~15 EUR)
+ESTIMATED_EBAY_EU_DELIVERY_PLN = 65.0
+
+NON_EU_KEYWORDS: tuple[str, ...] = (
+    "united states",
+    "stany zjednoczone",
+    "usa",
+    "canada",
+    "kanada",
+    "united kingdom",
+    "wielka brytania",
+    "uk",
+    "great britain",
+    "australia",
+    "china",
+    "chiny",
+    "japan",
+    "japonia",
+    "hong kong",
+    "switzerland",
+    "szwajcaria",
+    "schweiz",
+    "norway",
+    "norwegia",
+)
+
+
+def _is_non_eu_listing(text: str, currency: str) -> bool:
+    if currency.upper() not in ("EUR", "PLN"):
+        return True
+    lower = (text or "").lower()
+    for kw in NON_EU_KEYWORDS:
+        if re.search(rf"(?<![a-z]){re.escape(kw)}(?![a-z])", lower):
+            return True
+    return False
+
 
 class EbayScraper(BaseScraper):
     """
-    Parser for ebay.pl (covering Polish & European eBay sellers shipping to Poland).
-    - On first scan (`full_scan=True`): Paginates `_pgn=1..3` sorted by lowest Price+Shipping (`_sop=15`)
-      plus `_pgn=1` sorted by Newly Listed (`_sop=10`).
-    - On every 5-minute scan (`full_scan=False`): Checks BOTH `_sop=10` (Newly Listed) AND `_sop=15`
-      (Price + Shipping: lowest first) so neither brand-new listings nor price drops by existing
-      sellers are ever missed!
+    Parser for ebay.pl (covering Polish & European Union eBay sellers shipping to Poland).
+    Filters strictly to EU sellers (`LH_PrefLoc=3`) and adds estimated EU delivery when unknown.
     """
 
     source_name = "ebay.pl"
@@ -41,19 +73,19 @@ class EbayScraper(BaseScraper):
             for page in (1, 2, 3):
                 urls_to_fetch.append(
                     f"https://www.ebay.pl/sch/i.html?_nkw=LEGO+{set_number}"
-                    f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn={page}"
+                    f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&LH_PrefLoc=3&_sop=15&_ipg=120&_pgn={page}"
                 )
             urls_to_fetch.append(
                 f"https://www.ebay.pl/sch/i.html?_nkw=LEGO+{set_number}"
-                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1"
+                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&LH_PrefLoc=3&_sop=10&_ipg=120&_pgn=1"
             )
         else:
             # 5-minute run: check Newly Listed (_sop=10) AND Lowest Price+Shipping (_sop=15)
             urls_to_fetch = [
                 f"https://www.ebay.pl/sch/i.html?_nkw=LEGO+{set_number}"
-                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=10&_ipg=120&_pgn=1",
+                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&LH_PrefLoc=3&_sop=10&_ipg=120&_pgn=1",
                 f"https://www.ebay.pl/sch/i.html?_nkw=LEGO+{set_number}"
-                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&_sop=15&_ipg=120&_pgn=1",
+                f"&LH_ItemCondition=1000%7C1500&LH_BIN=1&LH_PrefLoc=3&_sop=15&_ipg=120&_pgn=1",
             ]
 
         offers: list[Offer] = []
@@ -133,6 +165,9 @@ class EbayScraper(BaseScraper):
             if not orig_price:
                 continue
             curr = detect_currency(price_text, default="EUR")
+            card_text = card.get_text(" ", strip=True)
+            if _is_non_eu_listing(card_text, curr):
+                continue
             item_price_pln = await currency_converter.to_pln(orig_price, curr)
 
             if not is_authentic_and_complete_set(
@@ -161,7 +196,8 @@ class EbayScraper(BaseScraper):
                     item_price_original=orig_price,
                     currency_original=curr,
                     item_price_pln=item_price_pln,
-                    delivery_price_pln=None,
+                    delivery_price_pln=ESTIMATED_EBAY_EU_DELIVERY_PLN,
+                    delivery_is_estimated=True,
                     delivery_time="EU Shipping (3-7 dni)",
                     condition=cond,
                     image_url=img_url,
@@ -209,6 +245,10 @@ class EbayScraper(BaseScraper):
             if not orig_price:
                 continue
             curr = detect_currency(price_raw, default="PLN")
+            loc_el = item.select_one(".s-item__location, .s-item__itemLocation")
+            loc_text = loc_el.get_text(" ", strip=True) if loc_el else ""
+            if _is_non_eu_listing(loc_text, curr):
+                continue
             item_price_pln = await currency_converter.to_pln(orig_price, curr)
 
             subtitle_el = item.select_one(".s-item__subtitle, .SECONDARY_INFO")
@@ -229,6 +269,7 @@ class EbayScraper(BaseScraper):
 
             ship_el = item.select_one(".s-item__shipping, .s-item__logisticsCost")
             delivery_pln: Optional[float] = None
+            delivery_is_est = False
             if ship_el:
                 ship_txt = ship_el.get_text(" ", strip=True)
                 if re.search(r"bezpłatna|darmowa|free", ship_txt, flags=re.I):
@@ -240,6 +281,9 @@ class EbayScraper(BaseScraper):
                         delivery_pln = await currency_converter.to_pln(
                             ship_num, ship_curr
                         )
+            if delivery_pln is None:
+                delivery_pln = ESTIMATED_EBAY_EU_DELIVERY_PLN
+                delivery_is_est = True
 
             img_el = item.select_one(".s-item__image-img, img")
             img_url = str(img_el.get("src", "")) if img_el else None
@@ -259,6 +303,7 @@ class EbayScraper(BaseScraper):
                     currency_original=curr,
                     item_price_pln=item_price_pln,
                     delivery_price_pln=delivery_pln,
+                    delivery_is_estimated=delivery_is_est,
                     delivery_time="EU / International (3-7 dni)",
                     condition=cond,
                     image_url=img_url,

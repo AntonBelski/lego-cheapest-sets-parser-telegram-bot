@@ -62,6 +62,37 @@ def format_source_label(source: Optional[str]) -> str:
     return raw.replace(".", "·")
 
 
+def format_short_store_label(source: Optional[str], store_name: Optional[str]) -> str:
+    """
+    Produce a concise store label for offer links, e.g. 'BrickLink', 'eBay', 'Vinted',
+    or 'Promoklocki: BricksBerg'.
+    """
+    src = (source or "").strip().lower()
+    if src in (
+        "bricklink.com",
+        "ebay.pl",
+        "vinted.pl",
+        "olx.pl",
+        "allegrolokalnie.pl",
+        "allegro.pl",
+        "smyk.com",
+        "empik.com",
+        "mediaexpert.pl",
+    ):
+        return format_source_label(src)
+
+    cleaned = (store_name or "").strip()
+    for suffix in (" (Promoklocki)", " (via Ceneo)", " (via zklockow)", " (via zklockow.pl)", " (PL Store)"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)].strip()
+    src_label = format_source_label(src)
+    if not cleaned:
+        return src_label
+    if src_label.lower() in cleaned.lower():
+        return cleaned
+    return f"{src_label}: {cleaned}"
+
+
 def format_logged_url_with_browser_link(url: str, set_number: str) -> str:
     """
     When a scraper queries an internal JSON/AJAX API URL (OLX, Vinted, BrickLink),
@@ -81,7 +112,7 @@ def format_logged_url_with_browser_link(url: str, set_number: str) -> str:
             web_url = f"https://www.vinted.pl/catalog?search_text=lego%20{set_number}&status_ids[]=6&status_ids[]=1&order=newest_first"
         return f"{u} ({web_url})"
     if "bricklink.com/ajax/clone/" in u:
-        web_url = f'https://www.bricklink.com/v2/catalog/catalogitem.page?S={set_number}-1#T=S&O={{"cond":"N","ii":0,"ic":0,"iconly":0}}'
+        web_url = f'https://www.bricklink.com/v2/catalog/catalogitem.page?S={set_number}-1#T=S&O={{"cond":"N","ii":0,"ic":0,"reg":"-1","iconly":0}}'
         return f"{u} ({web_url})"
     return u
 
@@ -166,6 +197,7 @@ class Offer:
     currency_original: str
     item_price_pln: float
     delivery_price_pln: Optional[float] = None  # None = unknown -> "(+delivery)"
+    delivery_is_estimated: bool = False
     delivery_time: Optional[str] = None
     condition: str = "New (Sealed)"  # "New (Sealed)" or "New (Open Box, Sealed Bags)"
     image_url: Optional[str] = None
@@ -174,6 +206,10 @@ class Offer:
 
     def __post_init__(self) -> None:
         self.url = sanitize_url_for_telegram(self.url)
+
+    @property
+    def short_store_label(self) -> str:
+        return format_short_store_label(self.source, self.store_name)
 
     @property
     def delivery_known(self) -> bool:
@@ -190,12 +226,18 @@ class Offer:
         Human-friendly final price with explicit delivery status:
         - Unknown delivery: '1250.00 PLN (delivery price unknown)'
         - Free delivery / Smart!: '1250.00 PLN (free delivery)'
+        - Estimated EU delivery: '1554.90 PLN (1489.90 PLN + 65.00 PLN est. EU delivery)'
         - Known paid delivery: '1264.99 PLN (1250.00 PLN + 14.99 PLN delivery)'
         """
         if self.delivery_price_pln is None:
             base = f"{self.total_price_pln:.2f} PLN (delivery price unknown)"
         elif self.delivery_price_pln == 0:
             base = f"{self.total_price_pln:.2f} PLN (free delivery)"
+        elif self.delivery_is_estimated:
+            base = (
+                f"{self.total_price_pln:.2f} PLN "
+                f"({self.item_price_pln:.2f} PLN + {self.delivery_price_pln:.2f} PLN est. EU delivery)"
+            )
         else:
             base = (
                 f"{self.total_price_pln:.2f} PLN "
@@ -215,18 +257,24 @@ class Offer:
         """
         if self.currency_original.upper() == "PLN":
             if self.delivery_price_pln is not None and self.delivery_price_pln > 0:
+                deliv_tag = "est. EU delivery" if self.delivery_is_estimated else "delivery"
                 price_part = (
                     f"{self.total_price_pln:.2f} zł "
-                    f"[{self.item_price_pln:.2f} zł + {self.delivery_price_pln:.2f} zł delivery]"
+                    f"[{self.item_price_pln:.2f} zł + {self.delivery_price_pln:.2f} zł {deliv_tag}]"
                 )
             elif self.delivery_price_pln == 0:
                 price_part = f"{self.total_price_pln:.2f} zł [free delivery]"
             else:
                 price_part = f"{self.total_price_pln:.2f} zł [delivery unknown]"
         else:
+            est_note = (
+                f", incl. +{self.delivery_price_pln:.2f} zł est. EU delivery"
+                if self.delivery_is_estimated and self.delivery_price_pln
+                else ""
+            )
             price_part = (
                 f"{self.item_price_original:.2f} {self.currency_original.upper()} "
-                f"(~{self.total_price_pln:.2f} zł)"
+                f"(~{self.total_price_pln:.2f} zł{est_note})"
             )
         return f"{self.title}: {self.url} ({price_part})"
 

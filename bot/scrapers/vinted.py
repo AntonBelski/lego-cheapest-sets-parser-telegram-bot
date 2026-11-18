@@ -17,6 +17,32 @@ from bot.services.http_client import HAS_CURL_CFFI, http_client
 logger = logging.getLogger(__name__)
 
 
+def apply_vinted_buyer_protection_fee(raw_price: float) -> float:
+    """
+    Compute Vinted Poland Buyer Protection fee-inclusive item price (`5% + 2.90 PLN`),
+    e.g. 283.06 -> 300.11 PLN, when Vinted only returns the base item price.
+    """
+    return round(raw_price * 1.05 + 2.90, 2)
+
+
+def _extract_vinted_amount_currency(raw_val, default_curr: str = "PLN") -> tuple[Optional[float], str]:
+    curr = default_curr
+    if isinstance(raw_val, dict):
+        try:
+            amt = float(raw_val.get("amount", 0))
+            curr = str(raw_val.get("currency_code", curr) or curr)
+            return (amt if amt > 0 else None), curr
+        except (TypeError, ValueError):
+            return None, curr
+    if raw_val is not None:
+        try:
+            amt = float(str(raw_val).replace(",", "."))
+            return (amt if amt > 0 else None), curr
+        except ValueError:
+            return None, curr
+    return None, curr
+
+
 class VintedScraper(BaseScraper):
     """
     Parser for vinted.pl using Vinted's v2 catalog JSON endpoint.
@@ -82,21 +108,20 @@ class VintedScraper(BaseScraper):
                 if not contains_set_number(title, set_number):
                     continue
 
-                raw_price = item.get("total_item_price") or item.get("price")
-                currency = str(item.get("currency", "PLN") or "PLN")
-                price_val: Optional[float] = None
+                default_curr = str(item.get("currency", "PLN") or "PLN")
+                base_val, base_curr = _extract_vinted_amount_currency(item.get("price"), default_curr)
+                total_val, total_curr = _extract_vinted_amount_currency(item.get("total_item_price"), base_curr)
 
-                if isinstance(raw_price, dict):
-                    try:
-                        price_val = float(raw_price.get("amount", 0))
-                        currency = str(raw_price.get("currency_code", currency))
-                    except (TypeError, ValueError):
-                        price_val = None
-                elif raw_price is not None:
-                    try:
-                        price_val = float(str(raw_price).replace(",", "."))
-                    except ValueError:
-                        price_val = None
+                if total_val is not None and (base_val is None or total_val > base_val):
+                    price_val, currency = total_val, total_curr
+                elif base_val is not None:
+                    price_val = apply_vinted_buyer_protection_fee(base_val)
+                    currency = base_curr
+                elif total_val is not None:
+                    price_val = apply_vinted_buyer_protection_fee(total_val)
+                    currency = total_curr
+                else:
+                    continue
 
                 if not price_val or price_val <= 0:
                     continue
@@ -193,10 +218,15 @@ class VintedScraper(BaseScraper):
             if not contains_set_number(title_part, set_number):
                 continue
 
+            # In Vinted catalog link titles ("..., 283.06 zł, 300.11 zł"), the last price includes the Vinted fee
             prices = re.findall(r"(\d[\d\s]*[,.]\d{2})\s*z[łl]", meta_title, flags=re.I)
             if not prices:
                 continue
-            price_val = parse_price_number(prices[0])
+            if len(prices) >= 2:
+                price_val = parse_price_number(prices[-1])
+            else:
+                raw_single = parse_price_number(prices[0])
+                price_val = apply_vinted_buyer_protection_fee(raw_single) if raw_single else None
             if not price_val or price_val <= 0:
                 continue
 

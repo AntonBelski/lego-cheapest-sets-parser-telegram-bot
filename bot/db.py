@@ -81,6 +81,12 @@ class Database:
                 )
             except Exception:
                 pass
+            try:
+                await db.execute(
+                    "ALTER TABLE price_observations ADD COLUMN delivery_is_estimated INTEGER NOT NULL DEFAULT 0;"
+                )
+            except Exception:
+                pass
 
             await db.execute(
                 """
@@ -245,6 +251,16 @@ class Database:
                        )
                    );
                 """
+            )
+            # Clean cached rows for temporarily disabled scrapers (bricklink.com, ebay.pl)
+            await db.execute(
+                "DELETE FROM price_observations WHERE source IN ('bricklink.com', 'ebay.pl');"
+            )
+            await db.execute(
+                "DELETE FROM daily_lowest_prices WHERE source IN ('bricklink.com', 'ebay.pl');"
+            )
+            await db.execute(
+                "DELETE FROM scraper_health WHERE source IN ('bricklink.com', 'ebay.pl');"
             )
 
             await db.commit()
@@ -454,9 +470,9 @@ class Database:
                             set_number, source, store_name, external_id, title, url,
                             item_price_original, currency_original, item_price_pln,
                             delivery_price_pln, total_price_pln, previous_price_pln,
-                            delivery_known, delivery_time, condition, in_user_range,
+                            delivery_known, delivery_is_estimated, delivery_time, condition, in_user_range,
                             observed_date, observed_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             set_number,
@@ -472,6 +488,7 @@ class Database:
                             offer.total_price_pln,
                             offer.previous_price_pln,
                             1 if offer.delivery_known else 0,
+                            1 if offer.delivery_is_estimated else 0,
                             offer.delivery_time,
                             offer.condition,
                             1 if in_range else 0,
@@ -616,7 +633,8 @@ class Database:
             async with db.execute(
                 """
                 SELECT source, store_name, title, url, item_price_pln, delivery_price_pln,
-                       total_price_pln, previous_price_pln, delivery_known, delivery_time,
+                       total_price_pln, previous_price_pln, delivery_known,
+                       delivery_is_estimated, delivery_time,
                        condition, MAX(observed_at) as seen_at
                 FROM price_observations
                 WHERE set_number = ?
