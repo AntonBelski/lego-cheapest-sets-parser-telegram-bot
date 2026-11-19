@@ -451,3 +451,34 @@ def test_vinted_fee_eu_filters_concise_line_and_merged_notification() -> None:
     assert len(overflow_many) == 20
     import re
     assert len(re.sub(r"<[^>]+>", "", cap_many)) <= 1024
+
+
+def test_format_per_set_parser_summary() -> None:
+    by_set = {
+        "21348": [
+            ScraperSiteReport(
+                set_number="21348",
+                source="zklockow.pl",
+                urls_scraped=[],
+                success=True,
+                offers=[],
+            ),
+            ScraperSiteReport(
+                set_number="21348",
+                source="promoklocki.pl",
+                urls_scraped=[],
+                success=False,
+                offers=[],
+                error_message="HTTP 403",
+            ),
+        ]
+    }
+    summary = LegoMonitorService.format_per_set_parser_summary(by_set)
+    expected_block = (
+        "Set 21348 parsing:\n"
+        "Succeeded 1/2 parsers:\n"
+        "1) zklockow.pl - PASSED\n"
+        "2) promoklocki.pl - FAILED"
+    )
+    assert expected_block in summary
+    assert LegoMonitorService.format_per_set_parser_summary({}) == ""

@@ -116,6 +116,8 @@ async def run_once(check_retirement: bool = False) -> None:
             await monitor.check_all_retirement_dates()
     finally:
         print(http_client.format_api_calls_summary(), flush=True)
+        if monitor.last_run_parser_summary:
+            print(monitor.last_run_parser_summary, flush=True)
         if bot:
             await bot.session.close()
 
@@ -319,6 +321,8 @@ async def run_daemon(
         if sync_git_db:
             await sync_db_state_to_git()
         print(http_client.format_api_calls_summary(), flush=True)
+        if monitor.last_run_parser_summary:
+            print(monitor.last_run_parser_summary, flush=True)
         await bot.session.close()
 
     if any_scan_failed:

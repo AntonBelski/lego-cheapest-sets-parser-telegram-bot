@@ -59,6 +59,7 @@ class LegoMonitorService:
         self.db = db
         self.bot = bot
         self.last_run_failed_sites_count: int = 0
+        self.last_run_parser_summary: str = ""
         self.promoklocki = PromoklockiScraper()
         self.scrapers: list[BaseScraper] = [
             OlxScraper(),
@@ -308,6 +309,31 @@ class LegoMonitorService:
         )
         return results
 
+    @staticmethod
+    def format_per_set_parser_summary(
+        by_set: dict[str, list[ScraperSiteReport]],
+    ) -> str:
+        """Format a compact per-set PASSED/FAILED summary across all parsers."""
+        if not by_set:
+            return ""
+        summary_lines: list[str] = [
+            "=" * 88,
+            "📊 PER-SET PARSER SUMMARY",
+            "=" * 88,
+        ]
+        for idx, (s_num, reps) in enumerate(by_set.items()):
+            if idx > 0:
+                summary_lines.append("")
+            s_passed = sum(1 for r in reps if r.success)
+            s_total = len(reps)
+            summary_lines.append(f"Set {s_num} parsing:")
+            summary_lines.append(f"Succeeded {s_passed}/{s_total} parsers:")
+            for p_idx, r in enumerate(reps, 1):
+                status_str = "PASSED" if r.success else "FAILED"
+                summary_lines.append(f"{p_idx}) {r.source} - {status_str}")
+        summary_lines.append("=" * 88)
+        return "\n".join(summary_lines)
+
     async def _finalize_and_persist_run_logs(
         self,
         started_at: str,
@@ -370,6 +396,9 @@ class LegoMonitorService:
             )
         lines.append("=" * 88)
         lines.append(http_client.format_api_calls_summary())
+        self.last_run_parser_summary = self.format_per_set_parser_summary(by_set)
+        if self.last_run_parser_summary:
+            lines.append(self.last_run_parser_summary)
 
         summary_text = "\n".join(lines)
         # 1. Print to stdout so GitHub Actions logs show the full scrollable table
