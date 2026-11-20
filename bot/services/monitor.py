@@ -48,6 +48,48 @@ from bot.services.retirement import match_retirement_milestone, retirement_servi
 logger = logging.getLogger(__name__)
 
 
+def classify_scraper_error(error_message: Optional[str]) -> str:
+    """Group scraper error messages into human-readable error categories."""
+    msg = (error_message or "").lower()
+    if not msg:
+        return "Other / Unknown Error"
+    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+        return "HTTP 429 / Rate Limit"
+    if "403" in msg or "datadome" in msg or "waf" in msg or "forbidden" in msg:
+        return "HTTP 403 / WAF Block"
+    if re.search(r"\b50[0-9]\b", msg):
+        return "HTTP 5xx / Upstream Server Error"
+    if "http 0" in msg or "timeout" in msg or "timed out" in msg or "connection" in msg:
+        return "Network / Timeout (HTTP 0)"
+    if "failed fetching" in msg:
+        return "Fetch / Relay Failure"
+    return "Other / Parse Error"
+
+
+def format_grouped_errors_summary(failed_reports: list[ScraperSiteReport]) -> str:
+    """Format failed scraper reports grouped by error type and site."""
+    if not failed_reports:
+        return ""
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for rep in failed_reports:
+        err_type = classify_scraper_error(rep.error_message)
+        grouped.setdefault(err_type, {}).setdefault(rep.source, []).append(rep.set_number)
+
+    lines = [f"[!] ERRORS GROUPED BY TYPE ({len(failed_reports)} failure(s)):"]
+    for err_type, by_site in sorted(
+        grouped.items(),
+        key=lambda kv: -sum(len(sets) for sets in kv[1].values()),
+    ):
+        type_total = sum(len(sets) for sets in by_site.values())
+        lines.append(f"  • {err_type} ({type_total}):")
+        for site, set_nums in sorted(by_site.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            unique_sets = sorted(set(set_nums))
+            lines.append(
+                f"      - {site}: {len(set_nums)} set(s) [{', '.join(unique_sets)}]"
+            )
+    return "\n".join(lines)
+
+
 class LegoMonitorService:
     """
     Coordinates multi-site scraping, full price history persistence, smart deduplication,
@@ -331,6 +373,10 @@ class LegoMonitorService:
             for p_idx, r in enumerate(reps, 1):
                 status_str = "PASSED" if r.success else "FAILED"
                 summary_lines.append(f"{p_idx}) {r.source} - {status_str}")
+        failed_all = [r for reps in by_set.values() for r in reps if not r.success]
+        if failed_all:
+            summary_lines.append("")
+            summary_lines.append(format_grouped_errors_summary(failed_all))
         summary_lines.append("=" * 88)
         return "\n".join(summary_lines)
 
@@ -384,6 +430,8 @@ class LegoMonitorService:
                     lines.append(f"            • {off.format_log_item_line()}")
 
         if failed_reports:
+            lines.append("")
+            lines.append(format_grouped_errors_summary(failed_reports))
             lines.append(
                 "\n[!] 5-MINUTE RUN MARKED AS FAILED BECAUSE AT LEAST ONE WEBSITE FAILED:"
             )

@@ -48,8 +48,14 @@ class AntiBlockHttpClient:
     def __init__(self) -> None:
         self._domain_locks: dict[str, asyncio.Lock] = {}
         self._domain_last_call: dict[str, float] = {}
+        self._url_locks: dict[str, asyncio.Lock] = {}
+        # Cache key: (url, use_jina_html_on_block) -> (expires_at_monotonic, status, text, headers)
+        self._response_cache: dict[tuple[str, bool], tuple[float, int, str, dict[str, str]]] = {}
         self.total_requests_made: int = 0
         self.requests_by_domain: dict[str, int] = {}
+
+    def clear_cache(self) -> None:
+        self._response_cache.clear()
 
     def record_external_call(self, url: str) -> None:
         domain = urlparse(url).netloc.lower() or "unknown"
@@ -74,16 +80,53 @@ class AntiBlockHttpClient:
             self._domain_locks[domain] = asyncio.Lock()
         return self._domain_locks[domain]
 
+    def _get_url_lock(self, cache_key: str) -> asyncio.Lock:
+        if cache_key not in self._url_locks:
+            self._url_locks[cache_key] = asyncio.Lock()
+        return self._url_locks[cache_key]
+
     async def _throttle_domain(self, domain: str) -> None:
         lock = self._get_domain_lock(domain)
         async with lock:
             last = self._domain_last_call.get(domain, 0.0)
             now = time.monotonic()
-            delay = random.uniform(settings.min_domain_delay_sec, settings.max_domain_delay_sec)
+            if domain == "r.jina.ai":
+                # Keep comfortably below r.jina.ai's free-tier 20 req/min rate limit
+                delay = random.uniform(3.2, 4.0)
+            else:
+                delay = random.uniform(settings.min_domain_delay_sec, settings.max_domain_delay_sec)
             wait_for = (last + delay) - now
             if wait_for > 0:
                 await asyncio.sleep(wait_for)
             self._domain_last_call[domain] = time.monotonic()
+
+    def _get_cached(self, url: str, use_jina_html_on_block: bool) -> tuple[int, str, dict[str, str]] | None:
+        now = time.monotonic()
+        # A successful 200 cached under either flag can always be reused
+        for flag in (use_jina_html_on_block, not use_jina_html_on_block):
+            entry = self._response_cache.get((url, flag))
+            if entry and entry[0] > now:
+                if entry[1] == 200 or flag == use_jina_html_on_block:
+                    return entry[1], entry[2], entry[3]
+        return None
+
+    def _set_cached(
+        self,
+        url: str,
+        use_jina_html_on_block: bool,
+        status: int,
+        text: str,
+        headers: dict[str, str],
+    ) -> None:
+        ttl = 120.0 if (status == 200 and text) else (60.0 if status == 403 else 0.0)
+        if ttl <= 0:
+            return
+        now = time.monotonic()
+        if len(self._response_cache) > 250:
+            expired = [k for k, v in self._response_cache.items() if v[0] <= now]
+            for k in expired:
+                self._response_cache.pop(k, None)
+        self._response_cache[(url, use_jina_html_on_block)] = (now + ttl, status, text, headers)
 
     def _choose_proxy(self) -> str | None:
         if settings.proxy_urls:
@@ -122,60 +165,81 @@ class AntiBlockHttpClient:
         timeout: float = 18.0,
         use_cf_worker_on_block: bool = True,
         use_jina_html_on_block: bool = True,
+        use_cache: bool = True,
     ) -> tuple[int, str, dict[str, str]]:
         """
-        Perform a GET request with TLS fingerprint impersonation and domain jitter.
+        Perform a GET request with TLS fingerprint impersonation, domain jitter,
+        short-lived response caching, and in-flight deduplication per URL.
         Returns (status_code, response_text, response_headers).
         """
-        domain = urlparse(url).netloc.lower()
-        await self._throttle_domain(domain)
-        self.record_external_call(url)
+        if use_cache:
+            cached = self._get_cached(url, use_jina_html_on_block)
+            if cached is not None:
+                return cached
 
-        proxy = self._choose_proxy()
-        target_url, req_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=False)
+        url_lock = self._get_url_lock(url)
+        async with url_lock:
+            if use_cache:
+                cached = self._get_cached(url, use_jina_html_on_block)
+                if cached is not None:
+                    return cached
 
-        status, text, resp_headers = await self._execute_get(target_url, req_headers, proxy, timeout)
-
-        # 1. If blocked (403/429/503) and Cloudflare Worker relay is configured, retry through Worker
-        if (
-            status in (0, 403, 429, 503)
-            and use_cf_worker_on_block
-            and settings.cf_worker_proxy_url
-        ):
-            logger.info("Retrying %s via Cloudflare Worker relay (initial status %d)", domain, status)
-            cf_url, cf_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=True)
+            domain = urlparse(url).netloc.lower()
+            await self._throttle_domain(domain)
             self.record_external_call(url)
-            status, text, resp_headers = await self._execute_get(cf_url, cf_headers, proxy, timeout)
 
-        # 2. Built-in zero-config edge HTML relay fallback for datacenter IPs (GitHub Actions Azure IPs)
-        if (
-            status in (0, 403, 429, 503)
-            and use_jina_html_on_block
-            and not url.startswith("https://r.jina.ai/")
-        ):
-            jina_url = f"https://r.jina.ai/{url}"
-            jina_headers = {
-                "User-Agent": USER_AGENTS[0],
-                "X-Return-Format": "html",
-            }
-            logger.info("Retrying %s via edge HTML relay (initial status %d)", domain, status)
-            self.record_external_call(jina_url)
-            j_status, j_text, j_hdrs = await self._execute_get(jina_url, jina_headers, proxy, timeout=22.0)
-            blocked_markers = (
-                "403 Forbidden",
-                "Warning: Target URL returned error 403",
-                "Dbamy o Twoje bezpieczeństwo",
-                "potwierdzenie, że nie jesteś robotem",
+            proxy = self._choose_proxy()
+            target_url, req_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=False)
+
+            status, text, resp_headers = await self._execute_get(
+                target_url, req_headers, proxy, timeout, retry_on_429=(domain == "r.jina.ai")
             )
-            if (
-                j_status == 200
-                and j_text
-                and len(j_text) > 1200
-                and not any(m in j_text[:2500] for m in blocked_markers)
-            ):
-                return 200, j_text, j_hdrs
 
-        return status, text, resp_headers
+            # 1. If blocked (403/429/503) and Cloudflare Worker relay is configured, retry through Worker
+            if (
+                status in (0, 403, 429, 503)
+                and use_cf_worker_on_block
+                and settings.cf_worker_proxy_url
+            ):
+                logger.info("Retrying %s via Cloudflare Worker relay (initial status %d)", domain, status)
+                cf_url, cf_headers = self._build_target_url_and_headers(url, headers, use_cf_worker=True)
+                self.record_external_call(url)
+                status, text, resp_headers = await self._execute_get(cf_url, cf_headers, proxy, timeout)
+
+            # 2. Built-in zero-config edge HTML relay fallback for datacenter IPs (GitHub Actions Azure IPs)
+            if (
+                status in (0, 403, 429, 503)
+                and use_jina_html_on_block
+                and not url.startswith("https://r.jina.ai/")
+            ):
+                jina_url = f"https://r.jina.ai/{url}"
+                jina_headers = {
+                    "User-Agent": USER_AGENTS[0],
+                    "X-Return-Format": "html",
+                }
+                logger.info("Retrying %s via edge HTML relay (initial status %d)", domain, status)
+                await self._throttle_domain("r.jina.ai")
+                self.record_external_call(jina_url)
+                j_status, j_text, j_hdrs = await self._execute_get(
+                    jina_url, jina_headers, proxy, timeout=22.0, retry_on_429=True
+                )
+                blocked_markers = (
+                    "403 Forbidden",
+                    "Warning: Target URL returned error 403",
+                    "Dbamy o Twoje bezpieczeństwo",
+                    "potwierdzenie, że nie jesteś robotem",
+                )
+                if (
+                    j_status == 200
+                    and j_text
+                    and len(j_text) > 1200
+                    and not any(m in j_text[:2500] for m in blocked_markers)
+                ):
+                    status, text, resp_headers = 200, j_text, j_hdrs
+
+            if use_cache:
+                self._set_cached(url, use_jina_html_on_block, status, text, resp_headers)
+            return status, text, resp_headers
 
     async def get_json(
         self,
@@ -186,7 +250,13 @@ class AntiBlockHttpClient:
         json_headers = {"Accept": "application/json, text/plain, */*"}
         if headers:
             json_headers.update(headers)
-        status, text, _ = await self.get_text(url, headers=json_headers, timeout=timeout)
+        # Never route JSON API requests through HTML-only edge relays (r.jina.ai)
+        status, text, _ = await self.get_text(
+            url,
+            headers=json_headers,
+            timeout=timeout,
+            use_jina_html_on_block=False,
+        )
         if status >= 400 or not text:
             return status, None
         import json
@@ -196,6 +266,41 @@ class AntiBlockHttpClient:
             return status, None
 
     async def _execute_get(
+        self,
+        url: str,
+        headers: dict[str, str],
+        proxy: str | None,
+        timeout: float,
+        retry_on_429: bool = False,
+    ) -> tuple[int, str, dict[str, str]]:
+        transient_statuses = {0, 500, 502, 503, 504}
+        if retry_on_429:
+            transient_statuses.add(429)
+
+        last_result: tuple[int, str, dict[str, str]] = (0, "", {})
+        for attempt in range(2):
+            last_result = await self._execute_get_once(url, headers, proxy, timeout)
+            status, _, resp_hdrs = last_result
+            if status not in transient_statuses or attempt == 1:
+                return last_result
+            backoff = random.uniform(1.5, 3.0)
+            if status == 429:
+                retry_after = resp_hdrs.get("retry-after", "")
+                try:
+                    backoff = min(max(float(retry_after), 4.0), 12.0)
+                except ValueError:
+                    backoff = 6.0
+            logger.debug(
+                "Transient HTTP %d for %s; retrying in %.1fs (attempt %d/2)",
+                status,
+                url,
+                backoff,
+                attempt + 2,
+            )
+            await asyncio.sleep(backoff)
+        return last_result
+
+    async def _execute_get_once(
         self,
         url: str,
         headers: dict[str, str],

@@ -333,6 +333,13 @@ class Subscription:
         high = f"{self.price_to:.0f} PLN" if self.price_to is not None else "∞"
         return f"{low} – {high}"
 
+    @property
+    def formatted_compact_range(self) -> str:
+        low = f"{self.price_from:.0f}" if self.price_from > 0 else "0"
+        if self.price_to is not None:
+            return f"{low} – {self.price_to:.0f} PLN"
+        return f"{low} – ∞ PLN"
+
 
 @dataclass
 class PriceStats:

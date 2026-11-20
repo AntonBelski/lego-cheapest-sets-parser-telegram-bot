@@ -21,7 +21,7 @@ from aiogram.types import (
 
 from bot.config import settings
 from bot.db import Database
-from bot.keyboards import main_menu_keyboard, set_actions_keyboard
+from bot.keyboards import main_menu_keyboard, set_actions_keyboard, subscriptions_list_keyboard
 from bot.models import (
     format_retirement_status_and_countdown,
     format_short_store_label,
@@ -75,11 +75,37 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             return True
         return chat_id == settings.telegram_chat_id
 
+    bot_username_cache: dict[str, Optional[str]] = {}
+
+    async def _get_bot_username(msg: Message) -> Optional[str]:
+        if "username" in bot_username_cache:
+            return bot_username_cache["username"]
+        username: Optional[str] = None
+        if msg.bot:
+            try:
+                me = await msg.bot.get_me()
+                username = me.username
+            except Exception:
+                username = None
+        bot_username_cache["username"] = username
+        return username
+
     @router.message(Command("start", "help"))
-    async def cmd_start(message: Message, state: FSMContext) -> None:
+    async def cmd_start(
+        message: Message,
+        state: FSMContext,
+        command: Optional[CommandObject] = None,
+    ) -> None:
         if not message.chat or not _is_authorized(message.chat.id):
             return
         await state.clear()
+        if command and command.args:
+            arg = command.args.strip()
+            if arg.startswith("set_"):
+                set_num = arg[4:].strip()
+                if set_num.isdigit():
+                    await _send_set_details(message, message.chat.id, set_num)
+                    return
         text = (
             "🧱 <b>LEGO Poland & EU Cheapest Set Tracker Bot</b>\n\n"
             "I check <b>13 Polish & European marketplaces/retailers</b> every <b>5 minutes</b> "
@@ -323,6 +349,46 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
         await safe_callback_answer(callback)
         await _send_subscriptions_list(callback.message, callback.message.chat.id)
 
+    @router.callback_query(F.data.startswith("set:view:"))
+    async def cb_view_set(callback: CallbackQuery) -> None:
+        if not callback.message or not _is_authorized(callback.message.chat.id):
+            return
+        await safe_callback_answer(callback)
+        set_number = (callback.data or "").split(":")[-1]
+        await _send_set_details(callback.message, callback.message.chat.id, set_number)
+
+    async def _send_set_details(msg: Message, chat_id: int, set_number: str) -> None:
+        sub = await db.get_subscription(chat_id, set_number)
+        if not sub:
+            await msg.answer(
+                f"⚠️ Set <b>LEGO {html.escape(set_number)}</b> is not in your subscriptions.",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        stats = await db.get_price_stats(sub.set_number)
+        msrp_txt = f"{sub.msrp_pln:.2f} PLN" if sub.msrp_pln else "N/A"
+        low30_txt = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "N/A"
+        lowall_txt = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "N/A"
+        ret_txt = format_retirement_status_and_countdown(
+            sub.retirement_date, sub.retirement_source
+        )
+
+        card_text = (
+            f"🧱 <b>LEGO {html.escape(sub.set_number)} — {html.escape(sub.set_name or 'LEGO Set')}</b>\n"
+            f"🎯 <b>Target Price Range:</b> <b>{html.escape(sub.formatted_range)}</b>\n"
+            f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_txt}\n"
+            f"📉 <b>Lowest (Last 30 Days):</b> {low30_txt}\n"
+            f"🏆 <b>Lowest (All Time):</b> {lowall_txt}\n"
+            f"⏳ <b>Retirement Status:</b> {html.escape(ret_txt)}"
+        )
+        await msg.answer(
+            card_text,
+            parse_mode="HTML",
+            reply_markup=set_actions_keyboard(sub.set_number),
+        )
+
     async def _send_subscriptions_list(msg: Message, chat_id: int) -> None:
         subs = await db.list_subscriptions(chat_id=chat_id)
         if not subs:
@@ -334,32 +400,23 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
             )
             return
 
-        await msg.answer(
-            f"📋 <b>Your Subscribed LEGO Sets ({len(subs)}):</b>",
-            parse_mode="HTML",
-        )
+        bot_username = await _get_bot_username(msg)
+        lines = ["<b>My subscribed sets:</b>"]
         for sub in subs:
-            stats = await db.get_price_stats(sub.set_number)
-            msrp_txt = f"{sub.msrp_pln:.2f} PLN" if sub.msrp_pln else "N/A"
-            low30_txt = f"{stats.lowest_30d_pln:.2f} PLN" if stats.lowest_30d_pln else "N/A"
-            lowall_txt = f"{stats.lowest_all_time_pln:.2f} PLN" if stats.lowest_all_time_pln else "N/A"
-            ret_txt = format_retirement_status_and_countdown(
-                sub.retirement_date, sub.retirement_source
-            )
+            title_str = f"LEGO {sub.set_number} — {sub.set_name or 'LEGO Set'}"
+            if bot_username:
+                href = f"https://t.me/{bot_username}?start=set_{sub.set_number}"
+                title_html = f'<a href="{html.escape(href, quote=True)}">{html.escape(title_str)}</a>'
+            else:
+                title_html = html.escape(title_str)
+            lines.append(f"{title_html} [{html.escape(sub.formatted_compact_range)}]")
 
-            card_text = (
-                f"🧱 <b>LEGO {html.escape(sub.set_number)} — {html.escape(sub.set_name or 'LEGO Set')}</b>\n"
-                f"🎯 <b>Target Price Range:</b> <b>{html.escape(sub.formatted_range)}</b>\n"
-                f"🏷 <b>LEGO.pl Catalog Price:</b> {msrp_txt}\n"
-                f"📉 <b>Lowest (Last 30 Days):</b> {low30_txt}\n"
-                f"🏆 <b>Lowest (All Time):</b> {lowall_txt}\n"
-                f"⏳ <b>Retirement Status:</b> {html.escape(ret_txt)}"
-            )
-            await msg.answer(
-                card_text,
-                parse_mode="HTML",
-                reply_markup=set_actions_keyboard(sub.set_number),
-            )
+        await msg.answer(
+            "\n".join(lines),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=subscriptions_list_keyboard(subs),
+        )
 
     # -------------------------------------------------------------------------
     # /remove Command & Callback

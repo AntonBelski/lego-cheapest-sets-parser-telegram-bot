@@ -481,4 +481,117 @@ def test_format_per_set_parser_summary() -> None:
         "2) promoklocki.pl - FAILED"
     )
     assert expected_block in summary
+    assert "ERRORS GROUPED BY TYPE (1 failure(s)):" in summary
+    assert "HTTP 403 / WAF Block (1):" in summary
     assert LegoMonitorService.format_per_set_parser_summary({}) == ""
+
+
+def test_subscriptions_list_keyboard_and_compact_range() -> None:
+    from bot.keyboards import main_menu_keyboard, subscriptions_list_keyboard
+
+    subs = [
+        Subscription(
+            id=1,
+            chat_id=123,
+            set_number="77092",
+            price_from=800.0,
+            price_to=1200.0,
+            set_name="Great Deku Tree 2-in-1",
+        ),
+        Subscription(
+            id=2,
+            chat_id=123,
+            set_number="76429",
+            price_from=250.0,
+            price_to=350.0,
+            set_name="Harry Potter - Mówiąca Tiara Przydziału",
+        ),
+        Subscription(
+            id=3,
+            chat_id=123,
+            set_number="10316",
+            price_from=0.0,
+            price_to=None,
+            set_name="Rivendell",
+        ),
+    ]
+    assert subs[0].formatted_compact_range == "800 – 1200 PLN"
+    assert subs[1].formatted_compact_range == "250 – 350 PLN"
+    assert subs[2].formatted_compact_range == "0 – ∞ PLN"
+
+    kb = subscriptions_list_keyboard(subs)
+    main_rows = main_menu_keyboard().inline_keyboard
+    assert len(kb.inline_keyboard) == len(subs) + len(main_rows)
+    assert kb.inline_keyboard[0][0].callback_data == "set:view:77092"
+    assert "77092" in kb.inline_keyboard[0][0].text
+    assert kb.inline_keyboard[1][0].callback_data == "set:view:76429"
+    assert kb.inline_keyboard[2][0].callback_data == "set:view:10316"
+    # Main menu buttons follow at the bottom
+    assert kb.inline_keyboard[3:] == main_rows
+
+
+def test_error_grouping_by_type() -> None:
+    from bot.services.monitor import classify_scraper_error, format_grouped_errors_summary
+
+    assert classify_scraper_error("HTTP 403 on https://promoklocki.pl/10335") == "HTTP 403 / WAF Block"
+    assert classify_scraper_error("HTTP 429 via r.jina.ai") == "HTTP 429 / Rate Limit"
+    assert classify_scraper_error("HTTP 502 on https://www.ceneo.pl/...") == "HTTP 5xx / Upstream Server Error"
+    assert classify_scraper_error("HTTP 0 (DataDome/WAF) on ...") == "HTTP 403 / WAF Block"
+    assert classify_scraper_error("HTTP 0 on https://example.com") == "Network / Timeout (HTTP 0)"
+
+    reports = [
+        ScraperSiteReport(set_number="10335", source="promoklocki.pl", success=False, error_message="HTTP 403 on https://promoklocki.pl/10335"),
+        ScraperSiteReport(set_number="21348", source="promoklocki.pl", success=False, error_message="HTTP 403 on https://promoklocki.pl/21348"),
+        ScraperSiteReport(set_number="76429", source="ceneo.pl", success=False, error_message="HTTP 502 on https://www.ceneo.pl/"),
+        ScraperSiteReport(set_number="77092", source="vinted.pl", success=False, error_message="HTTP 403 direct / HTTP 429 via r.jina.ai"),
+    ]
+    grouped = format_grouped_errors_summary(reports)
+    assert "ERRORS GROUPED BY TYPE (4 failure(s)):" in grouped
+    assert "HTTP 403 / WAF Block (2):" in grouped
+    assert "promoklocki.pl: 2 set(s) [10335, 21348]" in grouped
+    assert "HTTP 429 / Rate Limit (1):" in grouped
+    assert "HTTP 5xx / Upstream Server Error (1):" in grouped
+
+
+def test_vinted_direct_catalog_html_parser() -> None:
+    from bot.scrapers.vinted import VintedScraper
+
+    sample_html = """
+    <html><body>
+      <a href="/items/1234567890-lego-77092-great-deku-tree?referrer=catalog"
+         title="LEGO 77092 Great Deku Tree Nowy fabrycznie zamknięty, Marka: LEGO, Stan: Nowy z metką, 1100.00 zł, 1157.90 zł">Item</a>
+      <a href="/items/9876543210-lego-77092-empty-box?referrer=catalog"
+         title="LEGO 77092 puste pudełko empty box, Marka: LEGO, Stan: Nowy bez metki, 50.00 zł, 55.40 zł">Box</a>
+    </body></html>
+    """
+    scraper = VintedScraper()
+    offers = scraper._parse_vinted_catalog_html(sample_html, "77092", msrp_pln=1299.99, seen_ids=set())
+    assert len(offers) == 1
+    assert offers[0].external_id == "1234567890"
+    assert offers[0].item_price_pln == 1157.90
+    assert offers[0].url == "https://www.vinted.pl/items/1234567890-lego-77092-great-deku-tree"
+
+
+@pytest.mark.asyncio
+async def test_http_client_response_cache(monkeypatch) -> None:
+    from bot.services.http_client import AntiBlockHttpClient
+
+    client = AntiBlockHttpClient()
+    call_count = 0
+
+    async def fake_execute_get(url, headers, proxy, timeout, retry_on_429=False):
+        nonlocal call_count
+        call_count += 1
+        return 200, "<html>ok</html>", {}
+
+    async def no_sleep(domain):
+        return None
+
+    monkeypatch.setattr(client, "_execute_get", fake_execute_get)
+    monkeypatch.setattr(client, "_throttle_domain", no_sleep)
+
+    s1, t1, _ = await client.get_text("https://promoklocki.pl/21348")
+    s2, t2, _ = await client.get_text("https://promoklocki.pl/21348", use_jina_html_on_block=False)
+    assert s1 == 200 and t1 == "<html>ok</html>"
+    assert s2 == 200 and t2 == "<html>ok</html>"
+    assert call_count == 1

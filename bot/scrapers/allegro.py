@@ -250,6 +250,9 @@ class AllegroScraper(BaseScraper):
                 offers.extend(self._parse_allegro_listing_html(soup, set_number, msrp_pln))
             else:
                 self._record_failure(f"HTTP {status} (DataDome/WAF) on {url}")
+                # If the very first direct Allegro request is blocked by DataDome/WAF, skip the 2nd URL
+                if not direct_200 and status in (403, 429):
+                    break
 
         # Open identified Allegro product page(s) to scrape all seller options at the bottom
         for prod_url in list(product_urls_seen)[:2]:

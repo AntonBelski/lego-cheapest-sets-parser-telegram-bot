@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from typing import Sequence
+
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from bot.models import Subscription
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -20,6 +24,23 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             ],
         ]
     )
+
+
+def subscriptions_list_keyboard(subs: Sequence[Subscription]) -> InlineKeyboardMarkup:
+    """
+    One clickable button per subscribed set (opens detailed set view),
+    followed by all main menu buttons below.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for sub in subs:
+        label = f"🧱 LEGO {sub.set_number} — {sub.set_name or 'LEGO Set'}"
+        if len(label) > 60:
+            label = label[:59].rstrip() + "…"
+        rows.append(
+            [InlineKeyboardButton(text=label, callback_data=f"set:view:{sub.set_number}")]
+        )
+    rows.extend(main_menu_keyboard().inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def set_actions_keyboard(set_number: str) -> InlineKeyboardMarkup:
