@@ -133,7 +133,7 @@ class KlockiAppScraper(BaseScraper):
                 full_url = f"https://zklockow.pl{href}"
 
             clean_store = re.sub(r"[^a-z0-9_-]", "", store_name.lower())
-            ext_id = f"zk-{set_number}-{clean_store}-{idx}"
+            ext_id = f"zk-{set_number}-{clean_store}" if clean_store else f"zk-{set_number}-{idx}"
 
             offers.append(
                 Offer(

@@ -1,10 +1,48 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 from urllib.parse import quote, urlsplit, urlunsplit
+
+
+def is_unique_listing_url(url: str) -> bool:
+    """
+    Return True if `url` points to a specific listing/offer rather than a shared
+    multi-offer product/catalog page or bare site homepage.
+    """
+    raw = (url or "").strip().lower()
+    if not raw.startswith(("http://", "https://")):
+        return False
+    parts = urlsplit(raw)
+    path = parts.path.rstrip("/")
+    if not path:
+        return False
+    if "ceneo.pl" in parts.netloc and ";0280-0.htm" in path:
+        return False
+    if "brickmerge.de" in parts.netloc and "/go2/" not in path and "go2i=" not in parts.query:
+        return False
+    if "bricklink.com" in parts.netloc and "catalogitem.page" in path:
+        return False
+    if "promoklocki.pl" in parts.netloc and "/link/" not in path and "/oferta/" not in path:
+        return False
+    if "zklockow.pl" in parts.netloc and re.fullmatch(r"/lego-\d+", path):
+        return False
+    return True
+
+
+def format_short_delivery(
+    delivery_price_pln: Optional[float],
+    delivery_known: Optional[bool],
+) -> str:
+    """Compact delivery description for price-change comparisons ('unknown', 'free', or '13.99 PLN')."""
+    if not delivery_known or delivery_price_pln is None:
+        return "unknown"
+    if delivery_price_pln == 0:
+        return "free"
+    return f"{delivery_price_pln:.2f} PLN"
 
 
 def sanitize_url_for_telegram(url: str) -> str:
@@ -202,6 +240,10 @@ class Offer:
     condition: str = "New (Sealed)"  # "New (Sealed)" or "New (Open Box, Sealed Bags)"
     image_url: Optional[str] = None
     previous_price_pln: Optional[float] = None  # Populated when a listing's price changed
+    previous_item_price_pln: Optional[float] = None
+    previous_delivery_price_pln: Optional[float] = None
+    previous_delivery_known: Optional[bool] = None
+    was_previously_notified: bool = False
     found_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:
@@ -219,6 +261,73 @@ class Offer:
     def total_price_pln(self) -> float:
         """Final price in PLN including cheapest known delivery."""
         return round(self.item_price_pln + (self.delivery_price_pln or 0.0), 2)
+
+    @property
+    def has_price_change(self) -> bool:
+        return (
+            self.previous_price_pln is not None
+            and abs(self.previous_price_pln - self.total_price_pln) >= 1.0
+        )
+
+    @property
+    def price_change_pln(self) -> Optional[float]:
+        if not self.has_price_change or self.previous_price_pln is None:
+            return None
+        return round(self.total_price_pln - self.previous_price_pln, 2)
+
+    @property
+    def price_change_pct(self) -> Optional[float]:
+        if (
+            not self.has_price_change
+            or self.previous_price_pln is None
+            or self.previous_price_pln <= 0
+        ):
+            return None
+        return ((self.total_price_pln - self.previous_price_pln) / self.previous_price_pln) * 100.0
+
+    def format_delivery_change_short(self) -> Optional[str]:
+        """
+        Return a compact delivery transition string (e.g. 'delivery: 13.99 PLN ➔ unknown')
+        when previous item & delivery snapshot is known and only delivery changed.
+        """
+        if self.previous_item_price_pln is None or self.previous_delivery_known is None:
+            return None
+        prev_deliv = format_short_delivery(
+            self.previous_delivery_price_pln, self.previous_delivery_known
+        )
+        curr_deliv = format_short_delivery(self.delivery_price_pln, self.delivery_known)
+        item_changed = abs(self.previous_item_price_pln - self.item_price_pln) >= 0.01
+        if not item_changed and prev_deliv != curr_deliv:
+            return f"delivery: {prev_deliv} ➔ {curr_deliv}"
+        return None
+
+    def format_price_change_reason(self) -> str:
+        """
+        Human-readable explanation of what changed between previous and current price:
+        - Item unchanged & delivery changed: 'item unchanged at 1100.00 PLN; delivery: 13.99 PLN ➔ unknown'
+        - Both item & delivery changed: 'item: 1100.00 ➔ 1050.00 PLN; delivery: 13.99 PLN ➔ free'
+        - Only item price changed (or legacy snapshot): 'was 1113.99 PLN'
+        """
+        if self.previous_price_pln is None:
+            return ""
+        if self.previous_item_price_pln is not None and self.previous_delivery_known is not None:
+            prev_deliv = format_short_delivery(
+                self.previous_delivery_price_pln, self.previous_delivery_known
+            )
+            curr_deliv = format_short_delivery(self.delivery_price_pln, self.delivery_known)
+            item_changed = abs(self.previous_item_price_pln - self.item_price_pln) >= 0.01
+            deliv_changed = prev_deliv != curr_deliv
+            if not item_changed and deliv_changed:
+                return (
+                    f"item unchanged at {self.item_price_pln:.2f} PLN; "
+                    f"delivery: {prev_deliv} ➔ {curr_deliv}"
+                )
+            if item_changed and deliv_changed:
+                return (
+                    f"item: {self.previous_item_price_pln:.2f} ➔ {self.item_price_pln:.2f} PLN; "
+                    f"delivery: {prev_deliv} ➔ {curr_deliv}"
+                )
+        return f"was {self.previous_price_pln:.2f} PLN"
 
     @property
     def formatted_price(self) -> str:
@@ -243,11 +352,11 @@ class Offer:
                 f"{self.total_price_pln:.2f} PLN "
                 f"({self.item_price_pln:.2f} PLN + {self.delivery_price_pln:.2f} PLN delivery)"
             )
-        if (
-            self.previous_price_pln is not None
-            and abs(self.previous_price_pln - self.total_price_pln) >= 1.0
-        ):
-            return f"{self.previous_price_pln:.2f} PLN ➔ {base}"
+        if self.has_price_change and self.previous_price_pln is not None:
+            diff = self.price_change_pln or 0.0
+            pct = self.price_change_pct or 0.0
+            sign = "+" if diff > 0 else ""
+            return f"{self.previous_price_pln:.2f} PLN ➔ {base} [{sign}{diff:.2f} PLN / {sign}{pct:.1f}%]"
         return base
 
     def format_log_item_line(self) -> str:

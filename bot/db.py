@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from bot.models import Offer, PriceStats, ScraperSiteReport, SetMetadata, Subscription
+from bot.models import (
+    Offer,
+    PriceStats,
+    ScraperSiteReport,
+    SetMetadata,
+    Subscription,
+    is_unique_listing_url,
+)
 
 
 class Database:
@@ -100,6 +107,12 @@ class Database:
                 ON price_observations(set_number, source, external_id, id);
                 """
             )
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_price_obs_url
+                ON price_observations(set_number, source, url, id);
+                """
+            )
 
             # 3. Daily lowest price dynamics table (1 row per set_number per calendar day)
             await db.execute(
@@ -128,10 +141,28 @@ class Database:
                     external_id TEXT NOT NULL,
                     offer_fingerprint TEXT NOT NULL,
                     notified_price_pln REAL NOT NULL,
+                    notified_item_price_pln REAL NULL,
+                    notified_delivery_price_pln REAL NULL,
+                    notified_delivery_known INTEGER NULL,
                     url TEXT NOT NULL,
                     notified_at TEXT NOT NULL,
                     UNIQUE(chat_id, set_number, source, external_id)
                 );
+                """
+            )
+            for col_sql in (
+                "ALTER TABLE notified_offers ADD COLUMN notified_item_price_pln REAL NULL;",
+                "ALTER TABLE notified_offers ADD COLUMN notified_delivery_price_pln REAL NULL;",
+                "ALTER TABLE notified_offers ADD COLUMN notified_delivery_known INTEGER NULL;",
+            ):
+                try:
+                    await db.execute(col_sql)
+                except Exception:
+                    pass
+            await db.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_notified_offers_url
+                ON notified_offers(chat_id, set_number, source, url, id);
                 """
             )
 
@@ -442,7 +473,8 @@ class Database:
                 # Look up the most recent observation of this exact listing across ALL days
                 async with db.execute(
                     """
-                    SELECT total_price_pln, observed_date FROM price_observations
+                    SELECT total_price_pln, item_price_pln, delivery_price_pln, delivery_known, observed_date
+                    FROM price_observations
                     WHERE set_number = ? AND source = ? AND external_id = ?
                     ORDER BY id DESC LIMIT 1
                     """,
@@ -450,12 +482,35 @@ class Database:
                 ) as cursor:
                     prev = await cursor.fetchone()
 
+                if prev is None and is_unique_listing_url(offer.url):
+                    async with db.execute(
+                        """
+                        SELECT total_price_pln, item_price_pln, delivery_price_pln, delivery_known, observed_date
+                        FROM price_observations
+                        WHERE set_number = ? AND source = ? AND url = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (set_number, offer.source, offer.url),
+                    ) as cursor:
+                        prev = await cursor.fetchone()
+
                 prev_price: Optional[float] = None
                 if prev is not None:
                     last_seen_price = float(prev["total_price_pln"])
                     if abs(last_seen_price - offer.total_price_pln) >= 0.50:
                         prev_price = last_seen_price
                         offer.previous_price_pln = last_seen_price
+                        offer.previous_item_price_pln = (
+                            float(prev["item_price_pln"])
+                            if prev["item_price_pln"] is not None
+                            else None
+                        )
+                        offer.previous_delivery_price_pln = (
+                            float(prev["delivery_price_pln"])
+                            if prev["delivery_price_pln"] is not None
+                            else None
+                        )
+                        offer.previous_delivery_known = bool(prev["delivery_known"])
 
                 # Insert if never seen before, or seen on an earlier date, or its price changed
                 should_insert = (
@@ -635,7 +690,7 @@ class Database:
                 SELECT source, store_name, title, url, item_price_pln, delivery_price_pln,
                        total_price_pln, previous_price_pln, delivery_known,
                        delivery_is_estimated, delivery_time,
-                       condition, MAX(observed_at) as seen_at
+                       condition, MAX(id) as latest_id, observed_at as seen_at
                 FROM price_observations
                 WHERE set_number = ?
                   AND observed_date >= date('now', '-2 days')
@@ -654,33 +709,72 @@ class Database:
     async def should_notify_offer(self, chat_id: int, offer: Offer) -> bool:
         """
         Returns True if:
-        1) This specific offer `(source, external_id)` has NEVER been notified to `chat_id`
-           (including when it was previously observed at e.g. 2000 PLN outside the user's
-           range, and now dropped to 1500 PLN inside the user's range!), OR
-        2) It WAS previously notified to `chat_id` (e.g. at 1750 PLN), and the seller
-           dropped the price by at least 1.00 PLN (e.g. to 1500 PLN).
-           In that case, `offer.previous_price_pln` is also populated with the last notified
-           price if not already set.
+        1) This specific offer `(source, external_id)` (or same unique listing URL) has NEVER
+           been notified to `chat_id` (including when it was previously observed at e.g. 2000 PLN
+           outside the user's range, and now dropped to 1500 PLN inside the user's range!), OR
+        2) It WAS previously notified to `chat_id` (e.g. at 1113.99 PLN), and its total price
+           dropped by at least 1.00 PLN (e.g. to 1100.00 PLN).
+           In that case, `offer.previous_price_pln`, item/delivery snapshot, and
+           `offer.was_previously_notified = True` are populated from the previously notified
+           record so the second notification clearly displays how the price changed.
         """
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
                 """
-                SELECT notified_price_pln, offer_fingerprint
+                SELECT notified_price_pln, notified_item_price_pln,
+                       notified_delivery_price_pln, notified_delivery_known,
+                       offer_fingerprint
                 FROM notified_offers
                 WHERE chat_id = ? AND set_number = ? AND source = ? AND external_id = ?
                 """,
                 (chat_id, offer.set_number, offer.source, offer.external_id),
             ) as cursor:
                 row = await cursor.fetchone()
-                if not row:
-                    return True
-                prev_notified = float(row["notified_price_pln"])
-                if (prev_notified - offer.total_price_pln) >= 1.0:
-                    if offer.previous_price_pln is None:
-                        offer.previous_price_pln = prev_notified
-                    return True
-                return False
+
+            if row is None and is_unique_listing_url(offer.url):
+                async with db.execute(
+                    """
+                    SELECT notified_price_pln, notified_item_price_pln,
+                           notified_delivery_price_pln, notified_delivery_known,
+                           offer_fingerprint
+                    FROM notified_offers
+                    WHERE chat_id = ? AND set_number = ? AND source = ? AND url = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (chat_id, offer.set_number, offer.source, offer.url),
+                ) as cursor:
+                    row = await cursor.fetchone()
+
+            if not row:
+                return True
+
+            prev_notified = float(row["notified_price_pln"])
+            if (prev_notified - offer.total_price_pln) >= 1.0:
+                prior_obs_matches = (
+                    offer.previous_price_pln is not None
+                    and abs(offer.previous_price_pln - prev_notified) < 0.01
+                )
+                offer.previous_price_pln = prev_notified
+                offer.was_previously_notified = True
+                if row["notified_item_price_pln"] is not None:
+                    offer.previous_item_price_pln = float(row["notified_item_price_pln"])
+                    offer.previous_delivery_price_pln = (
+                        float(row["notified_delivery_price_pln"])
+                        if row["notified_delivery_price_pln"] is not None
+                        else None
+                    )
+                    offer.previous_delivery_known = (
+                        bool(row["notified_delivery_known"])
+                        if row["notified_delivery_known"] is not None
+                        else None
+                    )
+                elif not prior_obs_matches:
+                    offer.previous_item_price_pln = None
+                    offer.previous_delivery_price_pln = None
+                    offer.previous_delivery_known = None
+                return True
+            return False
 
     async def mark_offer_notified(self, chat_id: int, offer: Offer) -> None:
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -689,11 +783,16 @@ class Database:
                 """
                 INSERT INTO notified_offers (
                     chat_id, set_number, source, external_id,
-                    offer_fingerprint, notified_price_pln, url, notified_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    offer_fingerprint, notified_price_pln,
+                    notified_item_price_pln, notified_delivery_price_pln, notified_delivery_known,
+                    url, notified_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(chat_id, set_number, source, external_id) DO UPDATE SET
                     offer_fingerprint = excluded.offer_fingerprint,
                     notified_price_pln = excluded.notified_price_pln,
+                    notified_item_price_pln = excluded.notified_item_price_pln,
+                    notified_delivery_price_pln = excluded.notified_delivery_price_pln,
+                    notified_delivery_known = excluded.notified_delivery_known,
                     url = excluded.url,
                     notified_at = excluded.notified_at;
                 """,
@@ -704,10 +803,22 @@ class Database:
                     offer.external_id,
                     offer.offer_fingerprint,
                     offer.total_price_pln,
+                    offer.item_price_pln,
+                    offer.delivery_price_pln,
+                    1 if offer.delivery_known else 0,
                     offer.url,
                     now_iso,
                 ),
             )
+            if is_unique_listing_url(offer.url):
+                await db.execute(
+                    """
+                    DELETE FROM notified_offers
+                    WHERE chat_id = ? AND set_number = ? AND source = ?
+                      AND url = ? AND external_id != ?;
+                    """,
+                    (chat_id, offer.set_number, offer.source, offer.url, offer.external_id),
+                )
             await db.commit()
 
     # -------------------------------------------------------------------------

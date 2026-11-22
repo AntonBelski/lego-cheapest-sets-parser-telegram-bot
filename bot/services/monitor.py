@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import html
 import logging
 import re
@@ -488,8 +489,9 @@ class LegoMonitorService:
 
         unnotified: list[Offer] = []
         for offer in matching:
-            if await self.db.should_notify_offer(sub.chat_id, offer):
-                unnotified.append(offer)
+            sub_offer = replace(offer)
+            if await self.db.should_notify_offer(sub.chat_id, sub_offer):
+                unnotified.append(sub_offer)
 
         if not unnotified:
             return
@@ -567,6 +569,18 @@ class LegoMonitorService:
             else ""
         )
         safe_href = html.escape(sanitize_url_for_telegram(off.url), quote=True)
+        if off.has_price_change and off.previous_price_pln is not None:
+            diff = off.price_change_pln or 0.0
+            pct = off.price_change_pct or 0.0
+            sign = "+" if diff > 0 else ""
+            price_label = f"<s>{off.previous_price_pln:.2f}</s> ➔ {off.total_price_pln:.2f} PLN"
+            deliv_change = off.format_delivery_change_short()
+            deliv_display = html.escape(deliv_change) if deliv_change else deliv_part
+            delta_html = f"<b>{sign}{diff:.2f} PLN / {sign}{pct:.1f}%</b>"
+            return (
+                f'{idx}. <a href="{safe_href}"><b>{html.escape(off.short_store_label)} - {price_label}</b></a> '
+                f"({delta_html}, {deliv_display}{html.escape(orig_part)})"
+            )
         return (
             f'{idx}. <a href="{safe_href}"><b>{html.escape(off.short_store_label)} - {off.total_price_pln:.2f} PLN</b></a> '
             f"({deliv_part}{html.escape(orig_part)})"
@@ -632,19 +646,49 @@ class LegoMonitorService:
 
         details_html = ", ".join(detail_parts_html)
         best_href = html.escape(sanitize_url_for_telegram(best.url), quote=True)
-        store_link = f'<a href="{best_href}"><b>{html.escape(best.short_store_label)} - {best.total_price_pln:.2f} PLN</b></a>'
-
         ret_line = format_retirement_status_and_countdown(sub.retirement_date, None)
 
-        return [
+        lines = [
             f"<b>LEGO {html.escape(sub.set_number)} - {set_title}</b>",
             f"Official LEGO Catalog Price: <b>{msrp_str}</b>",
-            f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({details_html})",
-            store_link,
-            "",
-            f"Your Price Range: <b>{html.escape(sub.formatted_range)}</b>",
-            f"Retirement Status: {html.escape(ret_line)}",
         ]
+        if best.has_price_change and best.previous_price_pln is not None:
+            diff = best.price_change_pln or 0.0
+            pct = best.price_change_pct or 0.0
+            sign = "+" if diff > 0 else ""
+            icon = "📉" if diff < 0 else "📈"
+            vs_label = "vs previous alert" if best.was_previously_notified else "vs previous price"
+            reason = html.escape(best.format_price_change_reason())
+            lines.append(
+                f"Current Price: <s>{best.previous_price_pln:.2f} PLN</s> ➔ "
+                f"<b>{best.total_price_pln:.2f} PLN</b> ({details_html})"
+            )
+            lines.append(
+                f"{icon} Price Change: <b>{sign}{diff:.2f} PLN ({sign}{pct:.1f}%)</b> "
+                f"{vs_label} ({reason})"
+            )
+            store_link = (
+                f'<a href="{best_href}"><b>{html.escape(best.short_store_label)} - '
+                f"<s>{best.previous_price_pln:.2f} PLN</s> ➔ {best.total_price_pln:.2f} PLN</b></a>"
+            )
+        else:
+            lines.append(
+                f"Current Price: <b>{best.total_price_pln:.2f} PLN</b> ({details_html})"
+            )
+            store_link = (
+                f'<a href="{best_href}"><b>{html.escape(best.short_store_label)} - '
+                f"{best.total_price_pln:.2f} PLN</b></a>"
+            )
+
+        lines.extend(
+            [
+                store_link,
+                "",
+                f"Your Price Range: <b>{html.escape(sub.formatted_range)}</b>",
+                f"Retirement Status: {html.escape(ret_line)}",
+            ]
+        )
+        return lines
 
     @classmethod
     def split_caption_and_overflow_offers(
@@ -658,7 +702,7 @@ class LegoMonitorService:
         base_text = "\n".join(base_lines)
 
         if len(top_new_offers) <= 1:
-            return base_text[:1000], []
+            return base_text, []
 
         section_header = "\n\n🛒 <b>New / Price-Dropped Offers:</b>"
         offer_lines = [

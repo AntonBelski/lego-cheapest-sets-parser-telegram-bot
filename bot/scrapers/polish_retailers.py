@@ -210,8 +210,9 @@ class _BasePolishRetailerScraper(BaseScraper):
                 if price_val >= self.free_shipping_threshold
                 else self.standard_shipping
             )
+            clean_href = href.split("?")[0].split("#")[0].rstrip("/")
             ext_id = (
-                re.sub(r"[^a-zA-Z0-9_-]", "", href[-24:])
+                re.sub(r"[^a-zA-Z0-9_-]", "", clean_href[-32:])
                 or f"{self.source_name}-{idx}"
             )
 

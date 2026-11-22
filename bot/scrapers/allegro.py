@@ -136,8 +136,9 @@ class AllegroLokalnieScraper(BaseScraper):
                         if total_d and total_d >= item_price:
                             delivery_price = round(total_d - item_price, 2)
 
+                clean_href = href_str.split("?")[0].split("#")[0].rstrip("/")
                 ext_id = (
-                    re.sub(r"[^a-zA-Z0-9_-]", "", href_str[-24:]) or f"alok-{idx}"
+                    re.sub(r"[^a-zA-Z0-9_-]", "", clean_href[-36:]) or f"alok-{idx}"
                 )
                 offers.append(
                     Offer(
@@ -341,9 +342,15 @@ class AllegroScraper(BaseScraper):
                         if href.startswith("http")
                         else f"https://zklockow.pl{href}"
                     )
-                    ext_id = (
-                        re.sub(r"[^a-zA-Z0-9_-]", "", f"alg-{seller}-{idx}")
+                    m_alg_id = re.search(
+                        r"/oferta/(?:[^/?#]*-)?(\d{8,14})", full_url.split("?")[0]
                     )
+                    if m_alg_id:
+                        ext_id = m_alg_id.group(1)
+                    else:
+                        ext_id = re.sub(
+                            r"[^a-z0-9_-]", "", f"alg-{set_number}-{seller.lower()}"
+                        ) or f"alg-{set_number}-{idx}"
                     offers.append(
                         Offer(
                             set_number=set_number,
@@ -473,9 +480,12 @@ class AllegroScraper(BaseScraper):
                     if total_d and total_d >= item_price:
                         delivery_price = round(total_d - item_price, 2)
 
+            clean_href = href.split("?")[0].split("#")[0]
+            m_offer_id = re.search(r"/oferta/(?:[^/?#]*-)?(\d{8,14})", clean_href)
             ext_id = str(
                 art.get("data-analytics-view-value")
-                or re.sub(r"[^0-9]", "", href)[-14:]
+                or (m_offer_id.group(1) if m_offer_id else "")
+                or re.sub(r"[^0-9]", "", clean_href)[-14:]
                 or f"alg-{idx}"
             )
             parsed.append(

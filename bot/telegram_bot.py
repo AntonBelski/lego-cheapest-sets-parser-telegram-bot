@@ -574,13 +574,19 @@ def build_dispatcher(db: Database, monitor: LegoMonitorService) -> Dispatcher:
                 deliv_part = f"{item_p:.2f} PLN + {float(deliv_p):.2f} PLN delivery"
 
             price_badge = f"{total_p:.2f} PLN"
+            change_prefix = ""
             if prev_p is not None and abs(float(prev_p) - total_p) >= 1.0:
-                price_badge = f"<s>{float(prev_p):.2f} PLN</s> ➔ {price_badge}"
+                prev_f = float(prev_p)
+                diff_f = total_p - prev_f
+                pct_f = (diff_f / prev_f) * 100.0 if prev_f > 0 else 0.0
+                sign = "+" if diff_f > 0 else ""
+                price_badge = f"<s>{prev_f:.2f} PLN</s> ➔ {price_badge}"
+                change_prefix = f"<b>{sign}{diff_f:.2f} PLN / {sign}{pct_f:.1f}%</b>, "
 
             store_lbl = format_short_store_label(str(r.get("source") or ""), str(r.get("store_name") or ""))
             safe_href = html.escape(sanitize_url_for_telegram(str(r["url"])), quote=True)
             lines.append(
-                f'{idx}. <a href="{safe_href}"><b>{html.escape(store_lbl)} - {price_badge}</b></a> ({deliv_part})'
+                f'{idx}. <a href="{safe_href}"><b>{html.escape(store_lbl)} - {price_badge}</b></a> ({change_prefix}{deliv_part})'
             )
 
         await msg.answer(

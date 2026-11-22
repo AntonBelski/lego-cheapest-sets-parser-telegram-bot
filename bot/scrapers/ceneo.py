@@ -177,11 +177,12 @@ class CeneoScraper(BaseScraper):
                     else:
                         full_url = prod_url
 
+                clean_shop = re.sub(r"[^a-z0-9_-]", "", shop_domain.lower())
                 offer_id = str(
                     node.get("data-offer")
                     or node.get("data-offerid")
                     or (btn_el.get("data-offerid") if btn_el else "")
-                    or f"ceneo-{pid}-{idx}"
+                    or (f"ceneo-{pid}-{clean_shop}" if clean_shop else f"ceneo-{pid}-{idx}")
                 )
 
                 offers.append(

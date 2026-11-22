@@ -595,3 +595,257 @@ async def test_http_client_response_cache(monkeypatch) -> None:
     assert s1 == 200 and t1 == "<html>ok</html>"
     assert s2 == 200 and t2 == "<html>ok</html>"
     assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_second_notification_shows_price_change_olx_and_all_sites(tmp_path: Path) -> None:
+    import re
+    from bot.models import PriceStats, is_unique_listing_url
+
+    db = Database(tmp_path / "price_change_test.db")
+    await db.init()
+
+    sub = await db.upsert_subscription(
+        chat_id=196462642,
+        set_number="77092",
+        price_from=800.0,
+        price_to=1200.0,
+        set_name="Great Deku Tree 2-in-1",
+        msrp_pln=1299.99,
+    )
+    stats = PriceStats(set_number="77092")
+
+    # 1. Exact user-reported OLX scenario: 1113.99 (1100 + 13.99 delivery) -> 1100.00 (delivery unknown)
+    olx_first = Offer(
+        set_number="77092",
+        title="Klocki LEGO 77092",
+        source="olx.pl",
+        store_name="OLX.pl Seller",
+        url="https://www.olx.pl/d/oferta/klocki-lego-77092-CID88-ID1doz6d.html",
+        external_id="1040123456",
+        item_price_original=1100.0,
+        currency_original="PLN",
+        item_price_pln=1100.0,
+        delivery_price_pln=13.99,
+    )
+    await db.record_offers("77092", [olx_first], [sub])
+    assert await db.should_notify_offer(sub.chat_id, olx_first) is True
+    first_caption = LegoMonitorService.format_deal_notification_caption(sub, olx_first, [olx_first], stats)
+    assert "Price Change:" not in first_caption
+    assert "<s>" not in first_caption
+    await db.mark_offer_notified(sub.chat_id, olx_first)
+
+    olx_second = Offer(
+        set_number="77092",
+        title="Klocki LEGO 77092",
+        source="olx.pl",
+        store_name="OLX.pl Seller",
+        url="https://www.olx.pl/d/oferta/klocki-lego-77092-CID88-ID1doz6d.html",
+        external_id="1040123456",
+        item_price_original=1100.0,
+        currency_original="PLN",
+        item_price_pln=1100.0,
+        delivery_price_pln=None,
+    )
+    await db.record_offers("77092", [olx_second], [sub])
+    assert await db.should_notify_offer(sub.chat_id, olx_second) is True
+    assert olx_second.was_previously_notified is True
+    assert olx_second.previous_price_pln == 1113.99
+    assert olx_second.price_change_pln == -13.99
+
+    second_caption = LegoMonitorService.format_deal_notification_caption(sub, olx_second, [olx_second], stats)
+    assert "Current Price: <s>1113.99 PLN</s> ➔ <b>1100.00 PLN</b>" in second_caption
+    assert "📉 Price Change: <b>-13.99 PLN (-1.3%)</b> vs previous alert" in second_caption
+    assert "item unchanged at 1100.00 PLN; delivery: 13.99 PLN ➔ unknown" in second_caption
+    assert "<b>OLX - <s>1113.99 PLN</s> ➔ 1100.00 PLN</b>" in second_caption
+    assert second_caption.count("<s>") == second_caption.count("</s>")
+    assert second_caption.count("<b>") == second_caption.count("</b>")
+    assert second_caption.count("<a ") == second_caption.count("</a>")
+    assert len(re.sub(r"<[^>]+>", "", second_caption)) <= 1024
+    await db.mark_offer_notified(sub.chat_id, olx_second)
+
+    # 2. Intermediate price spike (1100 -> 1160 not notified -> 1050 notified):
+    #    Second notification MUST compare against last notified 1100.00, NOT intermediate 1160.00!
+    olx_spike = Offer(
+        set_number="77092",
+        title="Klocki LEGO 77092",
+        source="olx.pl",
+        store_name="OLX.pl Seller",
+        url="https://www.olx.pl/d/oferta/klocki-lego-77092-CID88-ID1doz6d.html",
+        external_id="1040123456",
+        item_price_original=1160.0,
+        currency_original="PLN",
+        item_price_pln=1160.0,
+        delivery_price_pln=None,
+    )
+    await db.record_offers("77092", [olx_spike], [sub])
+    assert await db.should_notify_offer(sub.chat_id, olx_spike) is False
+
+    olx_drop = Offer(
+        set_number="77092",
+        title="Klocki LEGO 77092",
+        source="olx.pl",
+        store_name="OLX.pl Seller",
+        url="https://www.olx.pl/d/oferta/klocki-lego-77092-CID88-ID1doz6d.html",
+        external_id="1040123456",
+        item_price_original=1050.0,
+        currency_original="PLN",
+        item_price_pln=1050.0,
+        delivery_price_pln=None,
+    )
+    await db.record_offers("77092", [olx_drop], [sub])
+    assert await db.should_notify_offer(sub.chat_id, olx_drop) is True
+    assert olx_drop.previous_price_pln == 1100.0
+    drop_caption = LegoMonitorService.format_deal_notification_caption(sub, olx_drop, [olx_drop], stats)
+    assert "Current Price: <s>1100.00 PLN</s> ➔ <b>1050.00 PLN</b>" in drop_caption
+    assert "📉 Price Change: <b>-50.00 PLN (-4.5%)</b> vs previous alert (was 1100.00 PLN)" in drop_caption
+
+    # 3. Verify identical second-notification price-change behavior across ALL monitored websites
+    site_samples = [
+        ("vinted.pl", "Vinted.pl Seller", "https://www.vinted.pl/items/987654321-lego-77092", "987654321", None),
+        ("allegrolokalnie.pl", "Allegro Lokalnie Seller", "https://allegrolokalnie.pl/oferta/lego-77092-nowy-xyz", "lego-77092-nowy-xyz", 0.0),
+        ("allegro.pl", "Allegro (SuperShop - Smart!)", "https://allegro.pl/oferta/18415806254", "18415806254", 0.0),
+        ("promoklocki.pl", "BricksBerg (Promoklocki)", "https://bricksberg.pl/lego-77092", "pk-77092-bricksberg", 0.0),
+        ("ceneo.pl", "Proshop (via Ceneo)", "https://www.ceneo.pl/Click/Offer/?e=abc123", "offer-123", 14.99),
+        ("brickmerge.de", "Amazon.de (via Brickmerge)", "https://www.brickmerge.de/go2/999", "bm-amazonde-77092", 0.0),
+        ("zklockow.pl", "mediaexpert.pl (via zklockow)", "https://zklockow.pl/przekierowanie/77092-me", "zk-77092-mediaexpertplviazklockow", 0.0),
+        ("smyk.com", "Smyk.com", "https://www.smyk.com/p/lego-77092-i999", "smyk-77092", 0.0),
+        ("empik.com", "Empik.com", "https://www.empik.com/lego-77092,p123,zabawki-p", "empik-77092", 0.0),
+        ("mediaexpert.pl", "MediaExpert.pl", "https://www.mediaexpert.pl/zabawki/lego-77092", "me-77092", 0.0),
+        ("ebay.pl", "eBay Seller (ships to PL)", "https://www.ebay.pl/itm/3355779911", "3355779911", 65.0),
+        ("bricklink.com", "BrickLink: EuroBricks (Germany)", "https://store.bricklink.com/EuroBricks#/shop?o=%7B%22invID%22:%22555111%22%7D", "555111", 65.0),
+    ]
+    batch_dropped: list[Offer] = []
+    for source, store, url, ext_id, deliv in site_samples:
+        off_v1 = Offer(
+            set_number="77092",
+            title="LEGO 77092 Great Deku Tree",
+            source=source,
+            store_name=store,
+            url=url,
+            external_id=ext_id,
+            item_price_original=1120.0,
+            currency_original="PLN",
+            item_price_pln=1120.0,
+            delivery_price_pln=deliv,
+        )
+        await db.record_offers("77092", [off_v1], [sub])
+        assert await db.should_notify_offer(sub.chat_id, off_v1) is True
+        await db.mark_offer_notified(sub.chat_id, off_v1)
+
+        off_v2 = Offer(
+            set_number="77092",
+            title="LEGO 77092 Great Deku Tree",
+            source=source,
+            store_name=store,
+            url=url,
+            external_id=ext_id,
+            item_price_original=1020.0,
+            currency_original="PLN",
+            item_price_pln=1020.0,
+            delivery_price_pln=deliv,
+        )
+        await db.record_offers("77092", [off_v2], [sub])
+        assert await db.should_notify_offer(sub.chat_id, off_v2) is True, f"Failed for {source}"
+        assert off_v2.was_previously_notified is True
+        assert off_v2.previous_price_pln == round(1120.0 + (deliv or 0.0), 2)
+        assert off_v2.price_change_pln == -100.0
+        cap_v2 = LegoMonitorService.format_deal_notification_caption(sub, off_v2, [off_v2], stats)
+        assert "📉 Price Change: <b>-100.00 PLN" in cap_v2
+        assert f"<s>{off_v2.previous_price_pln:.2f} PLN</s> ➔ <b>{off_v2.total_price_pln:.2f} PLN</b>" in cap_v2
+        line_v2 = LegoMonitorService._format_single_offer_html_line(1, off_v2)
+        assert f"<s>{off_v2.previous_price_pln:.2f}</s> ➔ {off_v2.total_price_pln:.2f} PLN" in line_v2
+        assert "<b>-100.00 PLN /" in line_v2
+        batch_dropped.append(off_v2)
+
+    # Multi-offer batch message also renders every offer's price change
+    batch_msg = LegoMonitorService.format_full_offers_batch_message(sub, batch_dropped)
+    assert batch_msg.count("<s>") == len(batch_dropped)
+    assert batch_msg.count("</s>") == len(batch_dropped)
+
+    # 4. URL fallback matching when external_id changes for the same unique link
+    vinted_changed_ext_id = Offer(
+        set_number="77092",
+        title="LEGO 77092 Great Deku Tree",
+        source="vinted.pl",
+        store_name="Vinted.pl Seller",
+        url="https://www.vinted.pl/items/987654321-lego-77092",
+        external_id="renamed-ext-id-987654321",
+        item_price_original=990.0,
+        currency_original="PLN",
+        item_price_pln=990.0,
+        delivery_price_pln=None,
+    )
+    assert await db.should_notify_offer(sub.chat_id, vinted_changed_ext_id) is True
+    assert vinted_changed_ext_id.was_previously_notified is True
+    assert vinted_changed_ext_id.previous_price_pln == 1120.0
+
+    # Shared catalog URLs must NOT trigger URL-fallback collisions across different stores
+    assert is_unique_listing_url("https://www.ceneo.pl/165836290;0280-0.htm") is False
+    assert is_unique_listing_url("https://www.brickmerge.de/77092-1") is False
+    assert is_unique_listing_url("https://www.olx.pl/d/oferta/klocki-lego-77092-CID88-ID1doz6d.html") is True
+
+
+@pytest.mark.asyncio
+async def test_multi_subscriber_price_change_isolation(tmp_path: Path, monkeypatch) -> None:
+    from bot.models import PriceStats
+
+    db = Database(tmp_path / "multi_sub.db")
+    await db.init()
+
+    sub_a = await db.upsert_subscription(chat_id=101, set_number="77092", price_from=0.0, price_to=1200.0, set_name="Great Deku Tree")
+    sub_b = await db.upsert_subscription(chat_id=202, set_number="77092", price_from=0.0, price_to=1200.0, set_name="Great Deku Tree")
+
+    # Subscriber A was previously notified at 1150 PLN; Subscriber B has never been notified
+    old_offer = Offer(
+        set_number="77092",
+        title="LEGO 77092",
+        source="vinted.pl",
+        store_name="Vinted.pl Seller",
+        url="https://www.vinted.pl/items/555555-lego-77092",
+        external_id="555555",
+        item_price_original=1150.0,
+        currency_original="PLN",
+        item_price_pln=1150.0,
+        delivery_price_pln=None,
+    )
+    await db.mark_offer_notified(sub_a.chat_id, old_offer)
+
+    sent_messages: dict[int, str] = {}
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            sent_messages[chat_id] = text
+
+        async def send_photo(self, chat_id: int, caption: str, **kwargs):
+            sent_messages[chat_id] = caption
+
+    async def fake_fetch_img(*args, **kwargs):
+        return None
+
+    import bot.services.monitor as monitor_mod
+    monkeypatch.setattr(monitor_mod, "fetch_set_image_bytes", fake_fetch_img)
+
+    monitor = LegoMonitorService(db=db, bot=FakeBot())  # type: ignore
+    new_offer = Offer(
+        set_number="77092",
+        title="LEGO 77092",
+        source="vinted.pl",
+        store_name="Vinted.pl Seller",
+        url="https://www.vinted.pl/items/555555-lego-77092",
+        external_id="555555",
+        item_price_original=1050.0,
+        currency_original="PLN",
+        item_price_pln=1050.0,
+        delivery_price_pln=None,
+    )
+    stats = PriceStats(set_number="77092")
+    await monitor._evaluate_and_notify_subscriber(sub_a, [new_offer], stats)
+    await monitor._evaluate_and_notify_subscriber(sub_b, [new_offer], stats)
+
+    # Subscriber A sees the price change from their previous alert (1150 -> 1050)
+    assert "<s>1150.00 PLN</s> ➔ <b>1050.00 PLN</b>" in sent_messages[101]
+    assert "vs previous alert" in sent_messages[101]
+    # Subscriber B receives a clean first-time notification without inheriting A's alert state
+    assert "vs previous alert" not in sent_messages[202]
+    assert "<s>1150.00 PLN</s>" not in sent_messages[202]
