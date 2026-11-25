@@ -91,6 +91,177 @@ def format_grouped_errors_summary(failed_reports: list[ScraperSiteReport]) -> st
     return "\n".join(lines)
 
 
+class WorkflowSessionStats:
+    """
+    Aggregates scan outcomes across a multi-check daemon workflow run (e.g. 3 hours
+    with 15-minute intervals):
+    - How many 15-minute checks passed vs failed (failed = at least 1 site failed)
+    - Per-site success rate over the entire workflow window (check-level & set-parse-level)
+    """
+
+    def __init__(self, interval_minutes: int = 15, window_minutes: Optional[int] = None) -> None:
+        self.interval_minutes = interval_minutes
+        self.window_minutes = window_minutes
+        self.total_checks: int = 0
+        self.failed_checks: int = 0
+        # Per-site counters:
+        #   checks_total: number of 15-min checks where this site was queried
+        #   checks_passed: number of checks where ALL parses for this site succeeded
+        #   parses_total: total individual (check, set) parses for this site
+        #   parses_passed: total succeeded (check, set) parses for this site
+        self._site_stats: dict[str, dict[str, int]] = {}
+
+    @property
+    def passed_checks(self) -> int:
+        return self.total_checks - self.failed_checks
+
+    @property
+    def overall_success_rate(self) -> float:
+        if self.total_checks == 0:
+            return 0.0
+        return (self.passed_checks / self.total_checks) * 100.0
+
+    def record_check(self, site_reports: list[ScraperSiteReport]) -> None:
+        """Record the outcome of one completed scan cycle."""
+        self.total_checks += 1
+        if any(not r.success for r in site_reports):
+            self.failed_checks += 1
+
+        by_site: dict[str, list[ScraperSiteReport]] = {}
+        for rep in site_reports:
+            by_site.setdefault(rep.source, []).append(rep)
+
+        for site, reps in by_site.items():
+            entry = self._site_stats.setdefault(
+                site,
+                {
+                    "checks_total": 0,
+                    "checks_passed": 0,
+                    "parses_total": 0,
+                    "parses_passed": 0,
+                },
+            )
+            entry["checks_total"] += 1
+            if all(r.success for r in reps):
+                entry["checks_passed"] += 1
+            entry["parses_total"] += len(reps)
+            entry["parses_passed"] += sum(1 for r in reps if r.success)
+
+    def get_site_rows(self) -> list[dict[str, object]]:
+        """Return per-site stats sorted by check success rate descending, then site name."""
+        rows: list[dict[str, object]] = []
+        for site, s in self._site_stats.items():
+            c_total = s["checks_total"]
+            c_passed = s["checks_passed"]
+            c_failed = c_total - c_passed
+            c_rate = (c_passed / c_total * 100.0) if c_total else 0.0
+            p_total = s["parses_total"]
+            p_passed = s["parses_passed"]
+            p_rate = (p_passed / p_total * 100.0) if p_total else 0.0
+            rows.append(
+                {
+                    "site": site,
+                    "checks_total": c_total,
+                    "checks_passed": c_passed,
+                    "checks_failed": c_failed,
+                    "check_success_rate": c_rate,
+                    "parses_total": p_total,
+                    "parses_passed": p_passed,
+                    "parse_success_rate": p_rate,
+                }
+            )
+        rows.sort(
+            key=lambda r: (
+                -float(r["check_success_rate"]),
+                -float(r["parse_success_rate"]),
+                str(r["site"]),
+            )
+        )
+        return rows
+
+    def format_text_summary(self) -> str:
+        """Format plain-text summary for stdout logs and scraper_runs.log."""
+        window_label = (
+            f"{self.window_minutes}m window"
+            if self.window_minutes
+            else "workflow session"
+        )
+        fail_rate = (
+            (self.failed_checks / self.total_checks * 100.0)
+            if self.total_checks
+            else 0.0
+        )
+        lines: list[str] = [
+            "=" * 88,
+            f"📊 WORKFLOW SESSION SUMMARY ({window_label}, {self.interval_minutes}-min checks)",
+            "=" * 88,
+            f"{self.interval_minutes}-MINUTE CHECKS SUMMARY:",
+            f"  Total checks : {self.total_checks}",
+            f"  Passed       : {self.passed_checks}/{self.total_checks} ({self.overall_success_rate:.1f}%)",
+            f"  Failed       : {self.failed_checks}/{self.total_checks} ({fail_rate:.1f}%)  [failure = at least 1 site failed]",
+        ]
+
+        rows = self.get_site_rows()
+        if rows:
+            lines.append("")
+            lines.append(f"PER-SITE SUCCESS RATE (over all {self.total_checks} check(s)):")
+            for idx, r in enumerate(rows, start=1):
+                site = str(r["site"])
+                c_passed = int(r["checks_passed"])
+                c_total = int(r["checks_total"])
+                c_failed = int(r["checks_failed"])
+                c_rate = float(r["check_success_rate"])
+                p_passed = int(r["parses_passed"])
+                p_total = int(r["parses_total"])
+                p_rate = float(r["parse_success_rate"])
+
+                parse_part = (
+                    f" | {p_passed}/{p_total} set parses ({p_rate:5.1f}%)"
+                    if p_total != c_total
+                    else ""
+                )
+                fail_part = f" | {c_failed} failed" if c_failed > 0 else ""
+                lines.append(
+                    f"  {idx:2d}) {site:<20} : {c_passed:2d}/{c_total:<2d} checks passed ({c_rate:5.1f}%){parse_part}{fail_part}"
+                )
+        lines.append("=" * 88)
+        return "\n".join(lines)
+
+    def format_markdown_summary(self) -> str:
+        """Format GitHub Actions Job Summary (Markdown) table."""
+        fail_rate = (
+            (self.failed_checks / self.total_checks * 100.0)
+            if self.total_checks
+            else 0.0
+        )
+        lines: list[str] = [
+            f"## 📊 Workflow Session Summary ({self.interval_minutes}-min checks)",
+            "",
+            f"- **Total {self.interval_minutes}-min checks:** {self.total_checks}",
+            f"- **Passed checks:** {self.passed_checks}/{self.total_checks} ({self.overall_success_rate:.1f}%)",
+            f"- **Failed checks (≥1 site failed):** {self.failed_checks}/{self.total_checks} ({fail_rate:.1f}%)",
+            "",
+        ]
+        rows = self.get_site_rows()
+        if rows:
+            lines.extend(
+                [
+                    "### Per-Site Success Rate",
+                    "",
+                    "| Site | Checks Passed | Check Success Rate | Set Parses Passed | Parse Success Rate |",
+                    "| --- | ---: | ---: | ---: | ---: |",
+                ]
+            )
+            for r in rows:
+                lines.append(
+                    f"| `{r['site']}` | {r['checks_passed']}/{r['checks_total']} | "
+                    f"{float(r['check_success_rate']):.1f}% | "
+                    f"{r['parses_passed']}/{r['parses_total']} | "
+                    f"{float(r['parse_success_rate']):.1f}% |"
+                )
+        return "\n".join(lines) + "\n"
+
+
 class LegoMonitorService:
     """
     Coordinates multi-site scraping, full price history persistence, smart deduplication,
@@ -103,6 +274,7 @@ class LegoMonitorService:
         self.bot = bot
         self.last_run_failed_sites_count: int = 0
         self.last_run_parser_summary: str = ""
+        self.last_run_reports: list[ScraperSiteReport] = []
         self.promoklocki = PromoklockiScraper()
         self.scrapers: list[BaseScraper] = [
             OlxScraper(),
@@ -394,6 +566,7 @@ class LegoMonitorService:
         FAILED if at least one website failed (while keeping all valid data in DB).
         """
         failed_reports = [r for r in all_reports if not r.success]
+        self.last_run_reports = list(all_reports)
         self.last_run_failed_sites_count = len(failed_reports)
         total_offers = sum(len(r.offers) for r in all_reports)
         overall_status = (

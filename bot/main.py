@@ -14,7 +14,7 @@ from aiogram import Bot
 from bot.config import settings
 from bot.db import Database
 from bot.services.http_client import http_client
-from bot.services.monitor import LegoMonitorService
+from bot.services.monitor import LegoMonitorService, WorkflowSessionStats
 from bot.telegram_bot import build_dispatcher, parse_optional_bound
 
 logging.basicConfig(
@@ -182,12 +182,14 @@ async def run_daemon(
     duration_minutes: Optional[int] = None,
     check_retirement: bool = False,
     sync_git_db: bool = False,
+    scan_interval_minutes: Optional[int] = None,
 ) -> None:
     """
-    Run the 24/7 Telegram bot + 5-minute price scheduler + 5-day retirement scheduler.
-    If `duration_minutes` is set (e.g. on GitHub Actions continuous runner mode),
-    runs long-polling + scheduled scans for `duration_minutes` and then exits cleanly
-    so the next queued GitHub Actions workflow run takes over seamlessly.
+    Run the 24/7 Telegram bot + scheduled price scanner + retirement scheduler.
+    If `duration_minutes` is set (e.g. 172 min for a 3-hour GitHub Actions window),
+    runs long-polling + periodic scans every `scan_interval_minutes` (e.g. 15 min),
+    exits cleanly before the next scheduled cron dispatch, and prints a full
+    session summary of passed/failed checks and per-site success rates.
     """
     if not settings.telegram_bot_token or settings.telegram_bot_token == "your_telegram_bot_token_here":
         logger.error("TELEGRAM_BOT_TOKEN is not set in .env! Please configure .env first.")
@@ -204,11 +206,36 @@ async def run_daemon(
     scan_lock = asyncio.Lock()
     any_scan_failed = False
 
-    async def _scheduled_price_scan() -> None:
+    effective_interval = (
+        scan_interval_minutes
+        if (scan_interval_minutes and scan_interval_minutes > 0)
+        else settings.price_check_interval_minutes
+    )
+    session_stats = WorkflowSessionStats(
+        interval_minutes=effective_interval,
+        window_minutes=duration_minutes,
+    )
+    loop = asyncio.get_running_loop()
+    deadline_mono: Optional[float] = (
+        loop.time() + duration_minutes * 60
+        if (duration_minutes and duration_minutes > 0)
+        else None
+    )
+
+    async def _scheduled_price_scan(is_initial: bool = False) -> None:
         nonlocal any_scan_failed
+        if not is_initial and deadline_mono is not None:
+            remaining_sec = deadline_mono - loop.time()
+            if remaining_sec < 180:
+                logger.info(
+                    "Skipping scheduled price scan because only %.0fs remain before clean shutdown.",
+                    max(0.0, remaining_sec),
+                )
+                return
         try:
             async with scan_lock:
                 await monitor.scan_all_subscribed_sets()
+                session_stats.record_check(monitor.last_run_reports)
                 if monitor.last_run_failed_sites_count > 0:
                     any_scan_failed = True
                 if sync_git_db:
@@ -227,11 +254,11 @@ async def run_daemon(
 
     scheduler = AsyncIOScheduler()
     if not duration_minutes:
-        # Permanent local 24/7 mode: repeat price check every 5 minutes & retirement check every ~5 days
+        # Permanent local 24/7 mode: repeat price check & retirement check indefinitely
         scheduler.add_job(
             _scheduled_price_scan,
             trigger="interval",
-            minutes=settings.price_check_interval_minutes,
+            minutes=effective_interval,
             id="price_scan_job",
             max_instances=1,
             coalesce=True,
@@ -247,19 +274,35 @@ async def run_daemon(
         scheduler.start()
         logger.info(
             "Scheduler started: price check every %d min, retirement check every %d days.",
-            settings.price_check_interval_minutes,
+            effective_interval,
             settings.retirement_check_interval_days,
+        )
+    elif duration_minutes > effective_interval:
+        # Multi-check GitHub Actions window (e.g. 3h workflow scanning every 15 min)
+        scheduler.add_job(
+            _scheduled_price_scan,
+            trigger="interval",
+            minutes=effective_interval,
+            id="price_scan_job",
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        logger.info(
+            "GitHub Actions polling mode (%d min): scanning at startup and every %d min.",
+            duration_minutes,
+            effective_interval,
         )
     else:
         logger.info(
-            "GitHub Actions 24/7 polling mode (%d min): scanning all sites once at startup.",
+            "GitHub Actions polling mode (%d min): scanning all sites once at startup.",
             duration_minutes,
         )
 
     # Trigger an initial background scan shortly after startup so dp.start_polling() completes bot.get_me() first
     async def _initial_tasks() -> None:
         await asyncio.sleep(2.0)
-        await _scheduled_price_scan()
+        await _scheduled_price_scan(is_initial=True)
         if check_retirement:
             await _scheduled_retirement_scan()
 
@@ -295,7 +338,9 @@ async def run_daemon(
     try:
         logger.info(
             "Starting Telegram Bot long-polling%s...",
-            f" (24/7 GitHub Actions window: {duration_minutes} min)" if duration_minutes else "",
+            f" (GitHub Actions window: {duration_minutes} min, scan every {effective_interval} min)"
+            if duration_minutes
+            else "",
         )
         polling_coro = dp.start_polling(bot, handle_signals=duration_minutes is None)
         if duration_minutes and duration_minutes > 0:
@@ -318,16 +363,43 @@ async def run_daemon(
                 scheduler.shutdown(wait=False)
         except Exception:
             pass
+
+        session_summary_text = (
+            session_stats.format_text_summary()
+            if session_stats.total_checks > 0
+            else ""
+        )
+        if session_summary_text:
+            try:
+                log_file = Path(settings.database_path).parent / "scraper_runs.log"
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with log_file.open("a", encoding="utf-8") as f:
+                    f.write(session_summary_text + "\n\n")
+            except Exception as exc:
+                logger.debug("Failed appending session summary to scraper_runs.log: %s", exc)
+
+            gh_summary_path = os.getenv("GITHUB_STEP_SUMMARY", "").strip()
+            if gh_summary_path:
+                try:
+                    with open(gh_summary_path, "a", encoding="utf-8") as f:
+                        f.write(session_stats.format_markdown_summary())
+                except Exception as exc:
+                    logger.debug("Failed writing GITHUB_STEP_SUMMARY: %s", exc)
+
         if sync_git_db:
             await sync_db_state_to_git()
         print(http_client.format_api_calls_summary(), flush=True)
         if monitor.last_run_parser_summary:
             print(monitor.last_run_parser_summary, flush=True)
+        if session_summary_text:
+            print(session_summary_text, flush=True)
         await bot.session.close()
 
     if any_scan_failed:
         logger.error(
-            "Exiting with code 1 because at least one website check failed during this run."
+            "Exiting with code 1 because %d/%d scheduled check(s) had at least one failed website.",
+            session_stats.failed_checks,
+            session_stats.total_checks,
         )
         sys.exit(1)
 
@@ -343,7 +415,13 @@ def main() -> None:
         "--daemon-minutes",
         type=int,
         default=None,
-        help="Run continuous 24/7 Telegram long-polling + 5-min scheduled scans for N minutes (for GitHub Actions)",
+        help="Run continuous Telegram long-polling + scheduled scans for N minutes (for GitHub Actions)",
+    )
+    parser.add_argument(
+        "--scan-interval-minutes",
+        type=int,
+        default=None,
+        help="Override interval in minutes between scheduled price scans in daemon mode (default: PRICE_CHECK_INTERVAL_MINUTES)",
     )
     parser.add_argument(
         "--sync-git-db",
@@ -365,6 +443,7 @@ def main() -> None:
                 duration_minutes=args.daemon_minutes,
                 check_retirement=args.check_retirement,
                 sync_git_db=args.sync_git_db,
+                scan_interval_minutes=args.scan_interval_minutes,
             )
         )
 

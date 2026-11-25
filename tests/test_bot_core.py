@@ -849,3 +849,217 @@ async def test_multi_subscriber_price_change_isolation(tmp_path: Path, monkeypat
     # Subscriber B receives a clean first-time notification without inheriting A's alert state
     assert "vs previous alert" not in sent_messages[202]
     assert "<s>1150.00 PLN</s>" not in sent_messages[202]
+
+
+def test_workflow_session_stats_summary_and_per_site_rates() -> None:
+    from bot.models import ScraperSiteReport
+    from bot.services.monitor import WorkflowSessionStats
+
+    stats = WorkflowSessionStats(interval_minutes=15, window_minutes=172)
+
+    # Check 1: 2 sets, all 3 sites succeed -> PASS
+    stats.record_check(
+        [
+            ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="ceneo.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="ceneo.pl", success=True),
+        ]
+    )
+    # Check 2: vinted.pl fails on 1 of 2 sets -> whole check FAILS, vinted fails check (1/2 parses)
+    stats.record_check(
+        [
+            ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="vinted.pl", success=False, error_message="HTTP 429"),
+            ScraperSiteReport(set_number="10316", source="ceneo.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="ceneo.pl", success=True),
+        ]
+    )
+    # Check 3: ceneo.pl fails on both sets -> whole check FAILS
+    stats.record_check(
+        [
+            ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="ceneo.pl", success=False, error_message="HTTP 403"),
+            ScraperSiteReport(set_number="75192", source="ceneo.pl", success=False, error_message="HTTP 403"),
+        ]
+    )
+    # Check 4: all succeed -> PASS
+    stats.record_check(
+        [
+            ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="olx.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="vinted.pl", success=True),
+            ScraperSiteReport(set_number="10316", source="ceneo.pl", success=True),
+            ScraperSiteReport(set_number="75192", source="ceneo.pl", success=True),
+        ]
+    )
+
+    assert stats.total_checks == 4
+    assert stats.passed_checks == 2
+    assert stats.failed_checks == 2
+    assert stats.overall_success_rate == pytest.approx(50.0)
+
+    rows = {r["site"]: r for r in stats.get_site_rows()}
+    assert rows["olx.pl"]["checks_passed"] == 4
+    assert rows["olx.pl"]["check_success_rate"] == pytest.approx(100.0)
+    assert rows["olx.pl"]["parses_passed"] == 8
+    assert rows["olx.pl"]["parses_total"] == 8
+
+    assert rows["vinted.pl"]["checks_passed"] == 3
+    assert rows["vinted.pl"]["checks_failed"] == 1
+    assert rows["vinted.pl"]["check_success_rate"] == pytest.approx(75.0)
+    assert rows["vinted.pl"]["parses_passed"] == 7
+    assert rows["vinted.pl"]["parses_total"] == 8
+    assert rows["vinted.pl"]["parse_success_rate"] == pytest.approx(87.5)
+
+    assert rows["ceneo.pl"]["checks_passed"] == 3
+    assert rows["ceneo.pl"]["checks_failed"] == 1
+    assert rows["ceneo.pl"]["check_success_rate"] == pytest.approx(75.0)
+    assert rows["ceneo.pl"]["parses_passed"] == 6
+    assert rows["ceneo.pl"]["parses_total"] == 8
+    assert rows["ceneo.pl"]["parse_success_rate"] == pytest.approx(75.0)
+
+    text = stats.format_text_summary()
+    assert "Total checks : 4" in text
+    assert "Passed       : 2/4 (50.0%)" in text
+    assert "Failed       : 2/4 (50.0%)" in text
+    assert "olx.pl" in text and "4/4" in text
+    assert "vinted.pl" in text and "3/4" in text and "7/8 set parses" in text
+    assert "ceneo.pl" in text and "6/8 set parses" in text
+
+    md = stats.format_markdown_summary()
+    assert "| `olx.pl` | 4/4 | 100.0% | 8/8 | 100.0% |" in md
+    assert "| `vinted.pl` | 3/4 | 75.0% | 7/8 | 87.5% |" in md
+    assert "| `ceneo.pl` | 3/4 | 75.0% | 6/8 | 75.0% |" in md
+
+
+@pytest.mark.asyncio
+async def test_run_daemon_multi_check_scheduler_and_summary(tmp_path: Path, monkeypatch, capsys) -> None:
+    import asyncio
+    import bot.main as main_mod
+    from bot.models import ScraperSiteReport
+
+    db_path = tmp_path / "daemon_test.db"
+    summary_file = tmp_path / "github_step_summary.md"
+
+    monkeypatch.setattr(main_mod.settings, "telegram_bot_token", "123456:FAKE_TOKEN")
+    monkeypatch.setattr(main_mod.settings, "database_path", db_path)
+    monkeypatch.setattr(main_mod.settings, "default_subscriptions", "")
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    scheduled_jobs: list[dict] = []
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.running = False
+
+        def add_job(self, func, **kwargs) -> None:
+            scheduled_jobs.append({"func": func, **kwargs})
+
+        def start(self) -> None:
+            self.running = True
+
+        def shutdown(self, wait: bool = False) -> None:
+            self.running = False
+
+    class FakeSession:
+        async def close(self) -> None:
+            return None
+
+    class FakeBot:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.session = FakeSession()
+
+    class FakeDispatcher:
+        async def start_polling(self, bot, handle_signals: bool = False) -> None:
+            # Let initial scan run and also invoke the scheduled job once manually
+            await asyncio.sleep(0.05)
+            for job in scheduled_jobs:
+                if job.get("id") == "price_scan_job":
+                    await job["func"]()
+            return None
+
+        async def stop_polling(self) -> None:
+            return None
+
+    scan_call_count = 0
+
+    class FakeMonitor:
+        def __init__(self, db, bot=None) -> None:
+            self.db = db
+            self.bot = bot
+            self.last_run_failed_sites_count = 0
+            self.last_run_parser_summary = ""
+            self.last_run_reports: list[ScraperSiteReport] = []
+
+        async def scan_all_subscribed_sets(self):
+            nonlocal scan_call_count
+            scan_call_count += 1
+            if scan_call_count == 1:
+                self.last_run_reports = [
+                    ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+                    ScraperSiteReport(set_number="10316", source="vinted.pl", success=True),
+                ]
+                self.last_run_failed_sites_count = 0
+            else:
+                self.last_run_reports = [
+                    ScraperSiteReport(set_number="10316", source="olx.pl", success=True),
+                    ScraperSiteReport(set_number="10316", source="vinted.pl", success=False, error_message="HTTP 429"),
+                ]
+                self.last_run_failed_sites_count = 1
+            return {}
+
+    monkeypatch.setattr(main_mod, "AsyncIOScheduler", FakeScheduler)
+    monkeypatch.setattr(main_mod, "Bot", FakeBot)
+    monkeypatch.setattr(main_mod, "build_dispatcher", lambda db, monitor: FakeDispatcher())
+    monkeypatch.setattr(main_mod, "LegoMonitorService", FakeMonitor)
+
+    # Speed up initial 2.0s sleep so test completes instantly
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay: float, *args, **kwargs):
+        if delay == 2.0:
+            await real_sleep(0.01)
+        elif delay >= 30:
+            await real_sleep(60.0)
+        else:
+            await real_sleep(delay)
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", fast_sleep)
+
+    with pytest.raises(SystemExit) as exc_info:
+        await main_mod.run_daemon(
+            duration_minutes=172,
+            check_retirement=False,
+            sync_git_db=False,
+            scan_interval_minutes=15,
+        )
+
+    assert exc_info.value.code == 1
+    assert scan_call_count == 2
+    assert any(j["id"] == "price_scan_job" and j["minutes"] == 15 for j in scheduled_jobs)
+
+    out = capsys.readouterr().out
+    assert "WORKFLOW SESSION SUMMARY (172m window, 15-min checks)" in out
+    assert "Total checks : 2" in out
+    assert "Passed       : 1/2 (50.0%)" in out
+    assert "Failed       : 1/2 (50.0%)" in out
+    assert "olx.pl" in out
+    assert "vinted.pl" in out
+
+    md = summary_file.read_text(encoding="utf-8")
+    assert "**Failed checks (≥1 site failed):** 1/2 (50.0%)" in md
+    assert "| `olx.pl` | 2/2 | 100.0% | 2/2 | 100.0% |" in md
+    assert "| `vinted.pl` | 1/2 | 50.0% | 1/2 | 50.0% |" in md
+
+    log_text = (tmp_path / "scraper_runs.log").read_text(encoding="utf-8")
+    assert "WORKFLOW SESSION SUMMARY" in log_text

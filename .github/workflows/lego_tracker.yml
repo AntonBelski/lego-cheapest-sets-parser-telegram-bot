@@ -22,7 +22,7 @@ permissions:
 jobs:
   track-lego-deals:
     runs-on: ubuntu-24.04
-    timeout-minutes: 18
+    timeout-minutes: 176
 
     steps:
       - name: Checkout repository
@@ -45,7 +45,7 @@ jobs:
           git fetch origin db-state:db-state 2>/dev/null || true
           git checkout db-state -- data/lego_tracker.db data/scraper_runs.log 2>/dev/null || true
 
-      - name: Run 24/7 Telegram Bot Server + 5-Minute Scheduled Price Scanner
+      - name: Run 3-Hour Telegram Bot Server + 15-Minute Scheduled Price Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -60,9 +60,9 @@ jobs:
           BRICKSET_API_KEY: ${{ secrets.BRICKSET_API_KEY }}
         run: |
           if [ "${{ inputs.check_retirement }}" = "true" ]; then
-            python -m bot.main --daemon-minutes 13 --sync-git-db --check-retirement
+            python -m bot.main --daemon-minutes 172 --scan-interval-minutes 15 --sync-git-db --check-retirement
           else
-            python -m bot.main --daemon-minutes 13 --sync-git-db
+            python -m bot.main --daemon-minutes 172 --scan-interval-minutes 15 --sync-git-db
           fi
 
       - name: Persist SQLite database & run logs to dedicated `db-state` branch
