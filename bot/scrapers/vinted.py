@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Optional
@@ -79,6 +80,15 @@ class VintedScraper(BaseScraper):
                 use_jina_html_on_block=False,
                 timeout=20.0,
             )
+            if status in (429, 503):
+                logger.info("Vinted direct returned HTTP %d; backing off 4s before retry", status)
+                await asyncio.sleep(4.0)
+                status, html, _ = await http_client.get_text(
+                    url,
+                    use_jina_html_on_block=False,
+                    use_cache=False,
+                    timeout=20.0,
+                )
             last_direct_status = status
             if status == 200 and html and "vinted" in html.lower() and "cf-challenge" not in html.lower():
                 any_direct_ok = True

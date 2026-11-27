@@ -11,6 +11,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 
 from bot.config import settings
 from bot.db import Database
@@ -364,11 +365,14 @@ async def run_daemon(
 
     init_task = asyncio.create_task(_initial_tasks())
 
+    stop_requested = False
     stop_timer_task: Optional[asyncio.Task] = None
     if duration_minutes and duration_minutes > 0:
         async def _stop_after_duration() -> None:
+            nonlocal stop_requested
             sleep_sec = max(30, duration_minutes * 60 - 15)
             await asyncio.sleep(sleep_sec)
+            stop_requested = True
             logger.info(
                 "Reached --daemon-minutes=%d window; stopping polling cleanly...",
                 duration_minutes,
@@ -398,14 +402,55 @@ async def run_daemon(
             if duration_minutes
             else "",
         )
-        polling_coro = dp.start_polling(bot, handle_signals=duration_minutes is None)
-        if duration_minutes and duration_minutes > 0:
+        polling_backoff = 5.0
+        while not stop_requested:
+            remaining: Optional[float] = None
+            if deadline_mono is not None:
+                remaining = deadline_mono - loop.time()
+                if remaining <= 1.0:
+                    logger.info("Polling window (%d min) reached; exiting cleanly.", duration_minutes)
+                    break
+            attempt_started = loop.time()
             try:
-                await asyncio.wait_for(polling_coro, timeout=duration_minutes * 60)
+                polling_coro = dp.start_polling(bot, handle_signals=duration_minutes is None)
+                if remaining is not None:
+                    await asyncio.wait_for(polling_coro, timeout=remaining)
+                else:
+                    await polling_coro
+                break
             except asyncio.TimeoutError:
                 logger.info("Polling window (%d min) reached via hard timeout; exiting cleanly.", duration_minutes)
-        else:
-            await polling_coro
+                break
+            except TelegramRetryAfter as exc:
+                if stop_requested:
+                    break
+                wait_sec = float(exc.retry_after) + 1.0
+                if deadline_mono is not None:
+                    rem = deadline_mono - loop.time()
+                    if rem <= 2.0:
+                        break
+                    wait_sec = min(wait_sec, rem - 1.0)
+                logger.warning("Telegram flood limit during polling; retrying in %.1fs...", wait_sec)
+                await asyncio.sleep(max(1.0, wait_sec))
+            except (TelegramServerError, TelegramNetworkError) as exc:
+                if stop_requested:
+                    break
+                if (loop.time() - attempt_started) > 60.0:
+                    polling_backoff = 5.0
+                wait_sec = polling_backoff
+                if deadline_mono is not None:
+                    rem = deadline_mono - loop.time()
+                    if rem <= 2.0:
+                        logger.info("Polling window ending after transient Telegram error; exiting cleanly.")
+                        break
+                    wait_sec = min(wait_sec, rem - 1.0)
+                logger.warning(
+                    "Transient Telegram API error during polling (%s); retrying in %.0fs...",
+                    exc,
+                    wait_sec,
+                )
+                await asyncio.sleep(max(1.0, wait_sec))
+                polling_backoff = min(polling_backoff * 2.0, 60.0)
     finally:
         if stop_timer_task and not stop_timer_task.done():
             stop_timer_task.cancel()

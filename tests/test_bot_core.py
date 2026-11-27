@@ -534,6 +534,7 @@ def test_error_grouping_by_type() -> None:
     from bot.services.monitor import classify_scraper_error, format_grouped_errors_summary
 
     assert classify_scraper_error("HTTP 403 on https://promoklocki.pl/10335") == "HTTP 403 / WAF Block"
+    assert classify_scraper_error("HTTP 403 on https://promoklocki.pl/76429") == "HTTP 403 / WAF Block"
     assert classify_scraper_error("HTTP 429 via r.jina.ai") == "HTTP 429 / Rate Limit"
     assert classify_scraper_error("HTTP 502 on https://www.ceneo.pl/...") == "HTTP 5xx / Upstream Server Error"
     assert classify_scraper_error("HTTP 0 (DataDome/WAF) on ...") == "HTTP 403 / WAF Block"
@@ -1306,3 +1307,234 @@ async def test_lego_com_price_drops_and_retired_restock_notifications(
     # E: Repeated check at same 1250 PLN while still available -> no duplicate spam
     await monitor.scan_lego_com_only()
     assert len(sent_messages) == 3
+
+
+@pytest.mark.asyncio
+async def test_run_daemon_retries_transient_telegram_server_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import asyncio
+    from aiogram.exceptions import TelegramServerError
+    from aiogram.methods import GetMe
+    import bot.main as main_mod
+    from bot.models import ScraperSiteReport
+
+    monkeypatch.setattr(main_mod.settings, "telegram_bot_token", "123456:FAKE_TOKEN")
+    monkeypatch.setattr(main_mod.settings, "database_path", tmp_path / "retry_daemon.db")
+    monkeypatch.setattr(main_mod.settings, "default_subscriptions", "")
+
+    class FakeScheduler:
+        def __init__(self) -> None:
+            self.running = False
+
+        def add_job(self, func, **kwargs) -> None:
+            return None
+
+        def start(self) -> None:
+            self.running = True
+
+        def shutdown(self, wait: bool = False) -> None:
+            self.running = False
+
+    class FakeSession:
+        async def close(self) -> None:
+            return None
+
+    class FakeBot:
+        def __init__(self, token: str) -> None:
+            self.token = token
+            self.session = FakeSession()
+
+    polling_attempts = 0
+
+    class FakeDispatcher:
+        async def start_polling(self, bot, handle_signals: bool = False) -> None:
+            nonlocal polling_attempts
+            polling_attempts += 1
+            if polling_attempts == 1:
+                raise TelegramServerError(method=GetMe(), message="Bad Gateway")
+            return None
+
+        async def stop_polling(self) -> None:
+            return None
+
+    class FakeMonitor:
+        def __init__(self, db, bot=None) -> None:
+            self.last_run_failed_sites_count = 0
+            self.last_run_parser_summary = ""
+            self.last_run_reports: list[ScraperSiteReport] = []
+
+        async def scan_all_subscribed_sets(self):
+            self.last_run_reports = [
+                ScraperSiteReport(set_number="10335", source="ceneo.pl", success=True)
+            ]
+            return {}
+
+    monkeypatch.setattr(main_mod, "AsyncIOScheduler", FakeScheduler)
+    monkeypatch.setattr(main_mod, "Bot", FakeBot)
+    monkeypatch.setattr(main_mod, "build_dispatcher", lambda db, monitor: FakeDispatcher())
+    monkeypatch.setattr(main_mod, "LegoMonitorService", FakeMonitor)
+
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(delay: float, *args, **kwargs):
+        if delay >= 30:
+            await real_sleep(60.0)
+        else:
+            await real_sleep(0.01)
+
+    monkeypatch.setattr(main_mod.asyncio, "sleep", fast_sleep)
+
+    await main_mod.run_daemon(
+        duration_minutes=177,
+        check_retirement=False,
+        sync_git_db=False,
+        scan_interval_minutes=15,
+    )
+    assert polling_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_lego_com_retries_and_falls_back_to_en_pl(monkeypatch) -> None:
+    import asyncio
+    import json
+    import bot.scrapers.lego_com as lego_com_mod
+
+    apollo = {
+        "SingleVariantProduct:10335": {
+            "productCode": "10335",
+            "name": "Endurance",
+            "slug": "the-endurance-10335",
+            "variant": {"__ref": "ProductVariant:10335"},
+        },
+        "ProductVariant:10335": {
+            "attributes": {"__ref": "ProductAttributes:10335"},
+            "price": {"__ref": "Price:10335"},
+            "listPrice": {"__ref": "ListPrice:10335"},
+        },
+        "ProductAttributes:10335": {
+            "availabilityStatus": "E_AVAILABLE",
+            "availabilityText": "Available now",
+            "canAddToBag": True,
+            "onSale": False,
+        },
+        "Price:10335": {"centAmount": 114999, "formattedValue": 1149.99, "currencyCode": "PLN"},
+        "ListPrice:10335": {"centAmount": 114999, "formattedValue": 1149.99, "currencyCode": "PLN"},
+    }
+    valid_html = f'<script id="__NEXT_DATA__">{json.dumps({"props": {"pageProps": {"__APOLLO_STATE__": apollo}}})}</script>'
+    waiting_room_html = "<html><head><title>LEGO Queue</title></head><body>Please wait</body></html>"
+
+    called_urls: list[str] = []
+
+    async def fake_get_text(url: str, **kwargs):
+        called_urls.append(url)
+        if "/pl-pl/" in url:
+            return 200, waiting_room_html, {}
+        return 200, valid_html, {}
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(lego_com_mod.http_client, "get_text", fake_get_text)
+    monkeypatch.setattr(lego_com_mod.asyncio, "sleep", no_sleep)
+
+    scraper = lego_com_mod.LegoComScraper()
+    rep = await scraper.scrape_with_report("10335")
+    assert rep.success is True
+    assert len(rep.offers) == 1
+    assert rep.offers[0].item_price_pln == 1149.99
+    assert called_urls == [
+        "https://www.lego.com/pl-pl/product/10335",
+        "https://www.lego.com/pl-pl/product/10335",
+        "https://www.lego.com/en-pl/product/10335",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ceneo_fallback_breaks_promoklocki_cascade(monkeypatch) -> None:
+    import bot.scrapers.allegro as allegro_mod
+    import bot.scrapers.ceneo as ceneo_mod
+    import bot.scrapers.klocki_app as klocki_mod
+    import bot.scrapers.polish_retailers as retailers_mod
+    import bot.scrapers.promoklocki as pk_mod
+
+    ceneo_search_html = """
+    <html><body>
+      <a class="js_seoUrl" href="/165836290">LEGO Ideas 21348 Dungeons &amp; Dragons</a>
+    </body></html>
+    """
+    ceneo_product_html = """
+    <html><body>
+      <div class="product-offer__container" data-price="1249.00" data-shopurl="smyk.com" data-offer="111">
+        <a class="js_product-offer-link">LEGO 21348 Dungeons &amp; Dragons</a>
+        <a class="button" href="/Click/Offer/?e=111">Idź do sklepu</a>
+        <span>Darmowa wysyłka</span>
+      </div>
+      <div class="product-offer__container" data-price="1279.00" data-shopurl="mediaexpert.pl" data-offer="222">
+        <a class="js_product-offer-link">LEGO 21348 Dungeons &amp; Dragons</a>
+        <a class="button" href="/Click/Offer/?e=222">Idź do sklepu</a>
+        <span>Darmowa wysyłka</span>
+      </div>
+      <div class="product-offer__container" data-price="1299.00" data-shopurl="allegro.pl" data-offer="333">
+        <a class="js_product-offer-link">LEGO 21348 Dungeons &amp; Dragons</a>
+        <a class="button" href="/Click/Offer/?e=333">Idź do sklepu</a>
+        <span>Darmowa wysyłka</span>
+      </div>
+    </body></html>
+    """
+
+    async def fake_get_text(url: str, **kwargs):
+        if "ceneo.pl/Klocki;szukaj" in url:
+            return 200, ceneo_search_html, {}
+        if "ceneo.pl/165836290" in url:
+            return 200, ceneo_product_html, {}
+        return 403, "", {}
+
+    for mod in (ceneo_mod, pk_mod, klocki_mod, allegro_mod, retailers_mod):
+        monkeypatch.setattr(mod.http_client, "get_text", fake_get_text)
+
+    monkeypatch.setattr(allegro_mod.settings, "allegro_client_id", "")
+    monkeypatch.setattr(allegro_mod.settings, "allegro_client_secret", "")
+
+    pk_rep = await pk_mod.PromoklockiScraper().scrape_with_report("21348")
+    zk_rep = await klocki_mod.KlockiAppScraper().scrape_with_report("21348")
+    alg_rep = await allegro_mod.AllegroScraper().scrape_with_report("21348")
+    smyk_rep = await retailers_mod.SmykScraper().scrape_with_report("21348")
+    me_rep = await retailers_mod.MediaExpertScraper().scrape_with_report("21348")
+
+    assert pk_rep.success is True and len(pk_rep.offers) == 3
+    assert zk_rep.success is True and len(zk_rep.offers) == 3
+    assert alg_rep.success is True and len(alg_rep.offers) == 1
+    assert smyk_rep.success is True and len(smyk_rep.offers) == 1
+    assert me_rep.success is True and len(me_rep.offers) == 1
+
+
+@pytest.mark.asyncio
+async def test_vinted_retries_direct_429_before_edge_fallback(monkeypatch) -> None:
+    import bot.scrapers.vinted as vinted_mod
+
+    vinted_html = """
+    <html><head><title>Vinted</title></head><body>
+      <a href="/items/987654321-lego-10335" title="LEGO 10335 Endurance, Marka: LEGO, Stan: Nowy z metką, 1000.00 zł, 1052.90 zł"></a>
+    </body></html>
+    """
+    calls: list[str] = []
+
+    async def fake_get_text(url: str, **kwargs):
+        calls.append(url)
+        assert "r.jina.ai" not in url
+        if len(calls) == 1:
+            return 429, "", {}
+        return 200, vinted_html, {}
+
+    async def no_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(vinted_mod.http_client, "get_text", fake_get_text)
+    monkeypatch.setattr(vinted_mod.asyncio, "sleep", no_sleep)
+
+    rep = await vinted_mod.VintedScraper().scrape_with_report("10335")
+    assert rep.success is True
+    assert len(rep.offers) == 1
+    assert rep.offers[0].external_id == "987654321"
+    assert len(calls) == 3  # 1st attempt (429) + retry (200) + 2nd sort URL (200)

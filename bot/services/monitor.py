@@ -56,9 +56,9 @@ def classify_scraper_error(error_message: Optional[str]) -> str:
     msg = (error_message or "").lower()
     if not msg:
         return "Other / Unknown Error"
-    if "429" in msg or "rate limit" in msg or "too many requests" in msg:
+    if re.search(r"\b429\b", msg) or "rate limit" in msg or "too many requests" in msg:
         return "HTTP 429 / Rate Limit"
-    if "403" in msg or "datadome" in msg or "waf" in msg or "forbidden" in msg:
+    if re.search(r"\b403\b", msg) or "datadome" in msg or "waf" in msg or "forbidden" in msg:
         return "HTTP 403 / WAF Block"
     if re.search(r"\b50[0-9]\b", msg):
         return "HTTP 5xx / Upstream Server Error"

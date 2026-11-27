@@ -243,6 +243,28 @@ class SmykScraper(_BasePolishRetailerScraper):
     free_shipping_threshold = 149.0
     standard_shipping = 12.99
 
+    def _map_aggregator_offers(self, offers: list[Offer], set_number: str) -> Optional[list[Offer]]:
+        matched: list[Offer] = []
+        for idx, off in enumerate(offers):
+            if "smyk" in off.store_name.lower() or "smyk" in off.url.lower():
+                matched.append(
+                    Offer(
+                        set_number=set_number,
+                        title=off.title,
+                        source=self.source_name,
+                        store_name=self.store_label,
+                        url=off.url,
+                        external_id=f"smyk-{set_number}" if idx == 0 else f"smyk-{set_number}-{idx}",
+                        item_price_original=off.item_price_original,
+                        currency_original="PLN",
+                        item_price_pln=off.item_price_pln,
+                        delivery_price_pln=0.0 if off.item_price_pln >= self.free_shipping_threshold else self.standard_shipping,
+                        delivery_time="1-2 dni robocze",
+                        condition="New (Sealed)",
+                    )
+                )
+        return matched
+
     async def fetch_offers(
         self,
         set_number: str,
@@ -252,10 +274,30 @@ class SmykScraper(_BasePolishRetailerScraper):
         url = f"https://www.smyk.com/pl/pl/search?q=lego%20{set_number}"
         self._record_url(url)
         status, html, _ = await http_client.get_text(url)
-        if status != 200 or not html:
-            self._record_failure(f"HTTP {status} on {url}")
-            return []
-        return self._parse_retail_html(html, set_number, msrp_pln)
+        if status == 200 and html:
+            return self._parse_retail_html(html, set_number, msrp_pln)
+
+        # Fallback 1: Promoklocki aggregator
+        from bot.scrapers.promoklocki import PromoklockiScraper
+        pk = PromoklockiScraper()
+        _, pk_offers, _ = await pk.fetch_metadata_and_history(set_number)
+        if pk.last_error is None:
+            self.last_error = None
+            return self._map_aggregator_offers(pk_offers, set_number) or []
+
+        # Fallback 2: Ceneo aggregator (shared 120s cache)
+        from bot.scrapers.ceneo import CeneoScraper
+        ceneo_rep = await CeneoScraper().scrape_with_report(
+            set_number=set_number,
+            msrp_pln=msrp_pln,
+            full_scan=False,
+        )
+        if ceneo_rep.success:
+            self.last_error = None
+            return self._map_aggregator_offers(ceneo_rep.offers, set_number) or []
+
+        self._record_failure(f"HTTP {status} on {url}")
+        return []
 
 
 class EmpikScraper(_BasePolishRetailerScraper):
@@ -351,6 +393,34 @@ class MediaExpertScraper(_BasePolishRetailerScraper):
         if pk.last_error is None:
             self.last_error = None
             for off in pk_offers:
+                if "mediaexpert" in off.store_name.lower() or "mediaexpert" in off.url.lower():
+                    return [
+                        Offer(
+                            set_number=set_number,
+                            title=off.title,
+                            source=self.source_name,
+                            store_name=self.store_label,
+                            url=off.url,
+                            external_id=f"me-{set_number}",
+                            item_price_original=off.item_price_original,
+                            currency_original="PLN",
+                            item_price_pln=off.item_price_pln,
+                            delivery_price_pln=0.0 if off.item_price_pln >= self.free_shipping_threshold else self.standard_shipping,
+                            delivery_time="1-2 dni robocze",
+                            condition="New (Sealed)",
+                        )
+                    ]
+            return []
+
+        from bot.scrapers.ceneo import CeneoScraper
+        ceneo_rep = await CeneoScraper().scrape_with_report(
+            set_number=set_number,
+            msrp_pln=msrp_pln,
+            full_scan=False,
+        )
+        if ceneo_rep.success:
+            self.last_error = None
+            for off in ceneo_rep.offers:
                 if "mediaexpert" in off.store_name.lower() or "mediaexpert" in off.url.lower():
                     return [
                         Offer(

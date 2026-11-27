@@ -411,6 +411,34 @@ class AllegroScraper(BaseScraper):
                             )
                         )
                         break
+                else:
+                    # 5. Final fallback via Ceneo aggregator when direct Allegro, zklockow & Promoklocki are all blocked
+                    from bot.scrapers.ceneo import CeneoScraper
+                    ceneo_rep = await CeneoScraper().scrape_with_report(
+                        set_number=set_number,
+                        msrp_pln=msrp_pln,
+                        full_scan=False,
+                    )
+                    if ceneo_rep.success:
+                        self.last_error = None
+                        for off in ceneo_rep.offers:
+                            if "allegro" in off.store_name.lower() or "allegro" in off.url.lower():
+                                offers.append(
+                                    Offer(
+                                        set_number=set_number,
+                                        title=off.title,
+                                        source=self.source_name,
+                                        store_name=off.store_name.replace(" (via Ceneo)", " (via Ceneo/Allegro)"),
+                                        url=off.url,
+                                        external_id=f"alg-ceneo-{off.external_id}",
+                                        item_price_original=off.item_price_original,
+                                        currency_original=off.currency_original,
+                                        item_price_pln=off.item_price_pln,
+                                        delivery_price_pln=off.delivery_price_pln,
+                                        delivery_time=off.delivery_time,
+                                        condition=off.condition,
+                                    )
+                                )
 
         return offers
 

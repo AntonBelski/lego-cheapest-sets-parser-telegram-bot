@@ -67,6 +67,35 @@ class PromoklockiScraper(BaseScraper):
         self._record_url(url)
         status, html, _ = await http_client.get_text(url)
         if status != 200 or not html:
+            # Fallback via Ceneo aggregator when both direct Promoklocki and r.jina.ai fail
+            from bot.scrapers.ceneo import CeneoScraper
+            ceneo_rep = await CeneoScraper().scrape_with_report(
+                set_number=set_number,
+                full_scan=False,
+            )
+            if ceneo_rep.success:
+                self.last_error = None
+                fallback_offers: list[Offer] = []
+                for off in ceneo_rep.offers:
+                    clean_s = off.store_name.replace(" (via Ceneo)", "")
+                    fallback_offers.append(
+                        Offer(
+                            set_number=off.set_number,
+                            title=off.title,
+                            source=self.source_name,
+                            store_name=f"{clean_s} (Promoklocki)",
+                            url=off.url,
+                            external_id=f"pk-ceneo-{off.external_id}",
+                            item_price_original=off.item_price_original,
+                            currency_original=off.currency_original,
+                            item_price_pln=off.item_price_pln,
+                            delivery_price_pln=off.delivery_price_pln,
+                            delivery_time=off.delivery_time,
+                            condition=off.condition,
+                            image_url=off.image_url,
+                        )
+                    )
+                return None, fallback_offers, []
             self._record_failure(f"HTTP {status} on {url}")
             return None, [], []
 

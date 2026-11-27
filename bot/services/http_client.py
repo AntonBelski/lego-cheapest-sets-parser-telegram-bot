@@ -118,7 +118,7 @@ class AntiBlockHttpClient:
         text: str,
         headers: dict[str, str],
     ) -> None:
-        ttl = 120.0 if (status == 200 and text) else (60.0 if status == 403 else 0.0)
+        ttl = 120.0 if (status == 200 and text) else (20.0 if status == 403 else 0.0)
         if ttl <= 0:
             return
         now = time.monotonic()
@@ -207,6 +207,14 @@ class AntiBlockHttpClient:
                 status, text, resp_headers = await self._execute_get(cf_url, cf_headers, proxy, timeout)
 
             # 2. Built-in zero-config edge HTML relay fallback for datacenter IPs (GitHub Actions Azure IPs)
+            blocked_markers = (
+                "403 Forbidden",
+                "Warning: Target URL returned error 403",
+                "Dbamy o Twoje bezpieczeństwo",
+                "potwierdzenie, że nie jesteś robotem",
+                "<title>Just a moment...</title>",
+                "Attention Required! | Cloudflare",
+            )
             if (
                 status in (0, 403, 429, 503)
                 and use_jina_html_on_block
@@ -217,17 +225,13 @@ class AntiBlockHttpClient:
                     "User-Agent": USER_AGENTS[0],
                     "X-Return-Format": "html",
                 }
+                if settings.jina_api_key:
+                    jina_headers["Authorization"] = f"Bearer {settings.jina_api_key}"
                 logger.info("Retrying %s via edge HTML relay (initial status %d)", domain, status)
                 await self._throttle_domain("r.jina.ai")
                 self.record_external_call(jina_url)
                 j_status, j_text, j_hdrs = await self._execute_get(
                     jina_url, jina_headers, proxy, timeout=22.0, retry_on_429=True
-                )
-                blocked_markers = (
-                    "403 Forbidden",
-                    "Warning: Target URL returned error 403",
-                    "Dbamy o Twoje bezpieczeństwo",
-                    "potwierdzenie, że nie jesteś robotem",
                 )
                 if (
                     j_status == 200
@@ -236,6 +240,37 @@ class AntiBlockHttpClient:
                     and not any(m in j_text[:2500] for m in blocked_markers)
                 ):
                     status, text, resp_headers = 200, j_text, j_hdrs
+                else:
+                    logger.info(
+                        "Edge HTML relay returned HTTP %d (len=%d) for %s",
+                        j_status,
+                        len(j_text or ""),
+                        domain,
+                    )
+
+            # 3. Secondary free relay fallback for smyk.com when both direct and r.jina.ai fail
+            if (
+                status in (0, 403, 429, 503)
+                and use_jina_html_on_block
+                and domain in ("www.smyk.com", "smyk.com")
+            ):
+                ao_url = f"https://api.allorigins.win/raw?url={quote(url, safe='')}"
+                logger.info("Retrying %s via AllOrigins relay (previous status %d)", domain, status)
+                await self._throttle_domain("api.allorigins.win")
+                self.record_external_call(ao_url)
+                ao_status, ao_text, ao_hdrs = await self._execute_get(
+                    ao_url,
+                    {"User-Agent": USER_AGENTS[0], "Accept": "text/html,*/*;q=0.8"},
+                    proxy,
+                    timeout=20.0,
+                )
+                if (
+                    ao_status == 200
+                    and ao_text
+                    and len(ao_text) > 1200
+                    and not any(m in ao_text[:2500] for m in blocked_markers)
+                ):
+                    status, text, resp_headers = 200, ao_text, ao_hdrs
 
             if use_cache:
                 self._set_cached(url, use_jina_html_on_block, status, text, resp_headers)

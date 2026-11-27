@@ -64,6 +64,38 @@ class KlockiAppScraper(BaseScraper):
                         )
                     )
                 return fallback_offers
+
+            # Secondary fallback via Ceneo aggregator when both zklockow and Promoklocki are blocked
+            from bot.scrapers.ceneo import CeneoScraper
+            ceneo_rep = await CeneoScraper().scrape_with_report(
+                set_number=set_number,
+                msrp_pln=msrp_pln,
+                full_scan=False,
+            )
+            if ceneo_rep.success:
+                self.last_error = None
+                ceneo_fallback: list[Offer] = []
+                for off in ceneo_rep.offers[:5]:
+                    clean_s = off.store_name.replace(" (via Ceneo)", "")
+                    ceneo_fallback.append(
+                        Offer(
+                            set_number=off.set_number,
+                            title=off.title,
+                            source=self.source_name,
+                            store_name=f"{clean_s} (via zklockow)",
+                            url=off.url,
+                            external_id=f"zk-ceneo-{off.external_id}",
+                            item_price_original=off.item_price_original,
+                            currency_original=off.currency_original,
+                            item_price_pln=off.item_price_pln,
+                            delivery_price_pln=off.delivery_price_pln,
+                            delivery_time=off.delivery_time,
+                            condition=off.condition,
+                            image_url=off.image_url,
+                        )
+                    )
+                return ceneo_fallback
+
             self._record_failure(f"HTTP {status} on {url}")
             return []
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -256,20 +257,40 @@ class LegoComScraper(BaseScraper):
         full_scan: bool = False,
     ) -> list[Offer]:
         self.last_statuses.pop(set_number, None)
-        url = f"https://www.lego.com/pl-pl/product/{set_number}"
-        self._record_url(url)
+        pl_url = f"https://www.lego.com/pl-pl/product/{set_number}"
+        en_pl_url = f"https://www.lego.com/en-pl/product/{set_number}"
 
-        # Always bypass response cache so midnight 1-minute checks reflect live stock/prices
-        status, html_text, _ = await http_client.get_text(url, use_cache=False)
-        if status == 404:
-            return []
-        if status != 200 or not html_text:
-            self._record_failure(f"HTTP {status} fetching {url}")
-            return []
+        prod: Optional[LegoComProductStatus] = None
+        last_diag = ""
+        attempts = [pl_url, pl_url, en_pl_url]
 
-        prod = self.parse_product_html(set_number, html_text)
+        for idx, target_url in enumerate(attempts):
+            if idx > 0:
+                await asyncio.sleep(2.0)
+            self._record_url(target_url)
+
+            # Always bypass response cache so midnight 1-minute checks reflect live stock/prices
+            status, html_text, _ = await http_client.get_text(target_url, use_cache=False)
+            if status == 404:
+                return []
+            if status != 200 or not html_text:
+                last_diag = f"HTTP {status} fetching {target_url}"
+                continue
+
+            parsed = self.parse_product_html(set_number, html_text)
+            if parsed is not None:
+                prod = parsed
+                break
+
+            title_m = re.search(r"<title[^>]*>(.*?)</title>", html_text, re.I | re.S)
+            title_snip = re.sub(r"\s+", " ", title_m.group(1)).strip()[:80] if title_m else ""
+            last_diag = (
+                f"Could not parse product payload for {set_number} on {target_url} "
+                f"(HTTP {status}, len={len(html_text)}, title={title_snip!r})"
+            )
+
         if prod is None:
-            self._record_failure(f"Could not parse product payload for {set_number} on lego.com")
+            self._record_failure(last_diag or f"Could not parse product payload for {set_number} on lego.com")
             return []
 
         if prod.price_pln is not None and prod.currency != "PLN":

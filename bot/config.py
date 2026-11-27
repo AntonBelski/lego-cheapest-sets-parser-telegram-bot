@@ -48,6 +48,9 @@ class Settings:
     cf_worker_secret: str = field(
         default_factory=lambda: os.getenv("CF_WORKER_SECRET", "").strip()
     )
+    jina_api_key: str = field(
+        default_factory=lambda: os.getenv("JINA_API_KEY", "").strip()
+    )
     min_domain_delay_sec: float = field(
         default_factory=lambda: float(os.getenv("MIN_DOMAIN_DELAY_SEC", "1.2"))
     )

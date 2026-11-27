@@ -53,6 +53,7 @@ jobs:
           PROXY_URLS: ${{ secrets.PROXY_URLS }}
           CF_WORKER_PROXY_URL: ${{ secrets.CF_WORKER_PROXY_URL }}
           CF_WORKER_SECRET: ${{ secrets.CF_WORKER_SECRET }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
           ALLEGRO_CLIENT_ID: ${{ secrets.ALLEGRO_CLIENT_ID }}
           ALLEGRO_CLIENT_SECRET: ${{ secrets.ALLEGRO_CLIENT_SECRET }}
           EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
