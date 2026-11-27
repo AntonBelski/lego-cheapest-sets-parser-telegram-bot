@@ -1047,16 +1047,21 @@ async def test_run_daemon_multi_check_scheduler_and_summary(tmp_path: Path, monk
     assert exc_info.value.code == 1
     assert scan_call_count == 2
     assert any(j["id"] == "price_scan_job" and j["minutes"] == 15 for j in scheduled_jobs)
+    from zoneinfo import ZoneInfo
+    from apscheduler.triggers.cron import CronTrigger
+
     pre_job = next(j for j in scheduled_jobs if j["id"] == "lego_com_midnight_pre")
     post_job = next(j for j in scheduled_jobs if j["id"] == "lego_com_midnight_post")
     assert pre_job["trigger"] == "cron"
-    assert pre_job["hour"] == 23
+    assert pre_job["hour"] == "23,0"
     assert pre_job["minute"] == "58,59"
     assert str(pre_job["timezone"]) == "Europe/Warsaw"
     assert post_job["trigger"] == "cron"
-    assert post_job["hour"] == 0
-    assert post_job["minute"] == "0-5"
+    assert post_job["hour"] == "0,1"
+    assert post_job["minute"] == "0-15"
     assert str(post_job["timezone"]) == "Europe/Warsaw"
+    CronTrigger(hour=pre_job["hour"], minute=pre_job["minute"], timezone=ZoneInfo("Europe/Warsaw"))
+    CronTrigger(hour=post_job["hour"], minute=post_job["minute"], timezone=ZoneInfo("Europe/Warsaw"))
 
     out = capsys.readouterr().out
     assert "WORKFLOW SESSION SUMMARY (172m window, 15-min checks)" in out

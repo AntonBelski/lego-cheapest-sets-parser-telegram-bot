@@ -551,7 +551,7 @@ class LegoMonitorService:
     async def scan_lego_com_only(self) -> tuple[dict[str, list[Offer]], bool]:
         """
         Fast targeted scan of LEGO.com Poland (`lego.com/pl-pl/product/<set>`) for all
-        subscribed sets. Used every minute during 23:58–00:05 Europe/Warsaw so newly
+        subscribed sets. Used every minute during 23:58–00:15 & 00:58–01:15 Europe/Warsaw so newly
         released or unexpectedly restocked retired sets are caught immediately.
         Returns `(offers_by_set, any_state_changed)`.
         """

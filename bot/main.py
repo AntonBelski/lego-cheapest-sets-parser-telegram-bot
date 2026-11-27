@@ -285,7 +285,7 @@ async def run_daemon(
         sched.add_job(
             _scheduled_lego_com_midnight_scan,
             trigger="cron",
-            hour=23,
+            hour="23,0",
             minute="58,59",
             timezone=warsaw_tz,
             id="lego_com_midnight_pre",
@@ -295,8 +295,8 @@ async def run_daemon(
         sched.add_job(
             _scheduled_lego_com_midnight_scan,
             trigger="cron",
-            hour=0,
-            minute="0-5",
+            hour="0,1",
+            minute="0-15",
             timezone=warsaw_tz,
             id="lego_com_midnight_post",
             max_instances=1,
@@ -325,7 +325,7 @@ async def run_daemon(
         _add_lego_com_midnight_jobs(scheduler)
         scheduler.start()
         logger.info(
-            "Scheduler started: price check every %d min, LEGO.com midnight check 23:58-00:05 Europe/Warsaw, retirement check every %d days.",
+            "Scheduler started: price check every %d min, LEGO.com midnight check 23:58-00:15 & 00:58-01:15 Europe/Warsaw, retirement check every %d days.",
             effective_interval,
             settings.retirement_check_interval_days,
         )
@@ -342,7 +342,7 @@ async def run_daemon(
         _add_lego_com_midnight_jobs(scheduler)
         scheduler.start()
         logger.info(
-            "GitHub Actions polling mode (%d min): scanning at startup and every %d min (+ LEGO.com every min 23:58-00:05 Europe/Warsaw).",
+            "GitHub Actions polling mode (%d min): scanning at startup and every %d min (+ LEGO.com every min 23:58-00:15 & 00:58-01:15 Europe/Warsaw).",
             duration_minutes,
             effective_interval,
         )
