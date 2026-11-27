@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 
@@ -204,7 +205,14 @@ async def run_daemon(
 
     dp = build_dispatcher(db, monitor)
     scan_lock = asyncio.Lock()
+    lego_com_lock = asyncio.Lock()
+    git_sync_lock = asyncio.Lock()
     any_scan_failed = False
+
+    async def _sync_db_locked() -> None:
+        if sync_git_db:
+            async with git_sync_lock:
+                await sync_db_state_to_git()
 
     effective_interval = (
         scan_interval_minutes
@@ -238,19 +246,62 @@ async def run_daemon(
                 session_stats.record_check(monitor.last_run_reports)
                 if monitor.last_run_failed_sites_count > 0:
                     any_scan_failed = True
-                if sync_git_db:
-                    await sync_db_state_to_git()
+                await _sync_db_locked()
         except asyncio.CancelledError:
             logger.info("Scheduled price scan cancelled cleanly during shutdown.")
+
+    async def _scheduled_lego_com_midnight_scan() -> None:
+        if deadline_mono is not None:
+            remaining_sec = deadline_mono - loop.time()
+            if remaining_sec < 30:
+                logger.info(
+                    "Skipping LEGO.com midnight scan because only %.0fs remain before clean shutdown.",
+                    max(0.0, remaining_sec),
+                )
+                return
+        try:
+            async with lego_com_lock:
+                _, any_changed = await monitor.scan_lego_com_only()
+                if any_changed:
+                    await _sync_db_locked()
+        except asyncio.CancelledError:
+            logger.info("LEGO.com midnight scan cancelled cleanly during shutdown.")
 
     async def _scheduled_retirement_scan() -> None:
         try:
             async with scan_lock:
                 await monitor.check_all_retirement_dates()
-                if sync_git_db:
-                    await sync_db_state_to_git()
+                await _sync_db_locked()
         except asyncio.CancelledError:
             logger.info("Scheduled retirement scan cancelled cleanly during shutdown.")
+
+    try:
+        warsaw_tz = ZoneInfo("Europe/Warsaw")
+    except Exception:
+        from datetime import timezone
+        warsaw_tz = timezone.utc  # type: ignore[assignment]
+
+    def _add_lego_com_midnight_jobs(sched: AsyncIOScheduler) -> None:
+        sched.add_job(
+            _scheduled_lego_com_midnight_scan,
+            trigger="cron",
+            hour=23,
+            minute="58,59",
+            timezone=warsaw_tz,
+            id="lego_com_midnight_pre",
+            max_instances=1,
+            coalesce=True,
+        )
+        sched.add_job(
+            _scheduled_lego_com_midnight_scan,
+            trigger="cron",
+            hour=0,
+            minute="0-5",
+            timezone=warsaw_tz,
+            id="lego_com_midnight_post",
+            max_instances=1,
+            coalesce=True,
+        )
 
     scheduler = AsyncIOScheduler()
     if not duration_minutes:
@@ -271,9 +322,10 @@ async def run_daemon(
             max_instances=1,
             coalesce=True,
         )
+        _add_lego_com_midnight_jobs(scheduler)
         scheduler.start()
         logger.info(
-            "Scheduler started: price check every %d min, retirement check every %d days.",
+            "Scheduler started: price check every %d min, LEGO.com midnight check 23:58-00:05 Europe/Warsaw, retirement check every %d days.",
             effective_interval,
             settings.retirement_check_interval_days,
         )
@@ -287,13 +339,17 @@ async def run_daemon(
             max_instances=1,
             coalesce=True,
         )
+        _add_lego_com_midnight_jobs(scheduler)
         scheduler.start()
         logger.info(
-            "GitHub Actions polling mode (%d min): scanning at startup and every %d min.",
+            "GitHub Actions polling mode (%d min): scanning at startup and every %d min (+ LEGO.com every min 23:58-00:05 Europe/Warsaw).",
             duration_minutes,
             effective_interval,
         )
     else:
+        if duration_minutes >= 2:
+            _add_lego_com_midnight_jobs(scheduler)
+            scheduler.start()
         logger.info(
             "GitHub Actions polling mode (%d min): scanning all sites once at startup.",
             duration_minutes,
@@ -386,8 +442,7 @@ async def run_daemon(
                 except Exception as exc:
                     logger.debug("Failed writing GITHUB_STEP_SUMMARY: %s", exc)
 
-        if sync_git_db:
-            await sync_db_state_to_git()
+        await _sync_db_locked()
         print(http_client.format_api_calls_summary(), flush=True)
         if monitor.last_run_parser_summary:
             print(monitor.last_run_parser_summary, flush=True)

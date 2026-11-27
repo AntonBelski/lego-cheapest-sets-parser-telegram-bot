@@ -8,6 +8,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.types import BufferedInputFile
@@ -32,6 +33,7 @@ from bot.scrapers.brickmerge import BrickmergeScraper
 from bot.scrapers.ceneo import CeneoScraper
 from bot.scrapers.ebay import EbayScraper
 from bot.scrapers.klocki_app import KlockiAppScraper
+from bot.scrapers.lego_com import LegoComScraper
 from bot.scrapers.olx import OlxScraper
 from bot.scrapers.polish_retailers import (
     EmpikScraper,
@@ -262,6 +264,19 @@ class WorkflowSessionStats:
         return "\n".join(lines) + "\n"
 
 
+def format_lego_com_prev_status_label(prev_state: dict) -> str:
+    """Format a previous LEGO.com unavailable status cleanly for restock notifications."""
+    status = str(prev_state.get("availability_status") or "").upper()
+    text = str(prev_state.get("availability_text") or "").strip()
+    if "RETIRED" in status:
+        return "Retired"
+    if "OUT_OF_STOCK" in status or "SOLD_OUT" in status:
+        return "Out of stock"
+    if "COMING_SOON" in status:
+        return "Coming soon"
+    return text or status or "Unavailable"
+
+
 class LegoMonitorService:
     """
     Coordinates multi-site scraping, full price history persistence, smart deduplication,
@@ -276,7 +291,9 @@ class LegoMonitorService:
         self.last_run_parser_summary: str = ""
         self.last_run_reports: list[ScraperSiteReport] = []
         self.promoklocki = PromoklockiScraper()
+        self.lego_com = LegoComScraper()
         self.scrapers: list[BaseScraper] = [
+            self.lego_com,
             OlxScraper(),
             VintedScraper(),
             AllegroLokalnieScraper(),
@@ -451,6 +468,8 @@ class LegoMonitorService:
                 msrp_pln=msrp_pln,
                 full_scan=full_scan,
             )
+            if scraper is self.lego_com:
+                await self._apply_lego_com_availability_state(set_number, rep.offers)
             await self.db.record_scraper_health(
                 scraper.source_name,
                 "OK" if rep.success else "ERROR",
@@ -486,6 +505,120 @@ class LegoMonitorService:
                 await self._evaluate_and_notify_subscriber(sub, all_offers, stats)
 
         return all_offers, site_reports
+
+    async def _apply_lego_com_availability_state(
+        self,
+        set_number: str,
+        offers: list[Offer],
+    ) -> bool:
+        """
+        Record LEGO.com availability in SQLite and annotate `lego.com` offers when a
+        previously retired / out-of-stock set becomes available again.
+        Returns True if availability or price changed vs the previously recorded snapshot.
+        """
+        prod = self.lego_com.last_statuses.get(set_number)
+        if prod is None:
+            return False
+
+        prev = await self.db.record_lego_com_availability(
+            set_number=set_number,
+            availability_status=prod.availability_status,
+            availability_text=prod.availability_text,
+            can_add_to_bag=prod.can_add_to_bag,
+            last_price_pln=prod.price_pln,
+        )
+
+        changed = (
+            prev is None
+            or bool(prev["can_add_to_bag"]) != prod.can_add_to_bag
+            or str(prev.get("availability_status") or "") != prod.availability_status
+            or (
+                prod.price_pln is not None
+                and prev.get("last_price_pln") is not None
+                and abs(float(prev["last_price_pln"]) - prod.price_pln) >= 0.50
+            )
+        )
+
+        if prod.can_add_to_bag and prev is not None and not bool(prev["can_add_to_bag"]):
+            prev_label = format_lego_com_prev_status_label(prev)
+            note = f"Back in stock on LEGO.com! (was: {prev_label})"
+            for off in offers:
+                if off.source == "lego.com":
+                    off.availability_change_note = note
+
+        return changed
+
+    async def scan_lego_com_only(self) -> tuple[dict[str, list[Offer]], bool]:
+        """
+        Fast targeted scan of LEGO.com Poland (`lego.com/pl-pl/product/<set>`) for all
+        subscribed sets. Used every minute during 23:58–00:05 Europe/Warsaw so newly
+        released or unexpectedly restocked retired sets are caught immediately.
+        Returns `(offers_by_set, any_state_changed)`.
+        """
+        await currency_converter.refresh_if_needed()
+        all_subs = await self.db.list_subscriptions()
+        unique_sets = sorted({s.set_number for s in all_subs})
+        results: dict[str, list[Offer]] = {}
+        any_changed = False
+        log_rows: list[str] = []
+
+        for set_num in unique_sets:
+            subs_for_set = [s for s in all_subs if s.set_number == set_num]
+            msrp_pln = next((s.msrp_pln for s in subs_for_set if s.msrp_pln), None)
+            rep = await self.lego_com.scrape_with_report(
+                set_number=set_num,
+                msrp_pln=msrp_pln,
+                full_scan=False,
+            )
+            changed = await self._apply_lego_com_availability_state(set_num, rep.offers)
+            await self.db.record_scraper_health(
+                self.lego_com.source_name,
+                "OK" if rep.success else "ERROR",
+                len(rep.offers),
+                urls_scraped=rep.urls_scraped,
+                error_message=rep.error_message,
+            )
+
+            if rep.offers:
+                await self.db.record_offers(set_num, rep.offers, subs_for_set)
+                if self.bot and subs_for_set:
+                    stats = await self.db.get_price_stats(set_num)
+                    for sub in subs_for_set:
+                        await self._evaluate_and_notify_subscriber(sub, rep.offers, stats)
+
+            results[set_num] = rep.offers
+            if changed or rep.offers:
+                any_changed = True
+
+            prod = self.lego_com.last_statuses.get(set_num)
+            if prod:
+                price_str = f"{prod.price_pln:.2f} PLN" if prod.price_pln else "N/A"
+                log_rows.append(
+                    f"  • {set_num}: {prod.availability_status} (buyable={prod.can_add_to_bag}, price={price_str})"
+                )
+            elif not rep.success:
+                log_rows.append(f"  • {set_num}: ERROR ({rep.error_message})")
+            else:
+                log_rows.append(f"  • {set_num}: not listed (404)")
+
+        if unique_sets:
+            try:
+                now_pl = datetime.now(ZoneInfo("Europe/Warsaw")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            except Exception:
+                now_pl = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            summary_block = "\n".join(
+                [f"[LEGO.com MIDNIGHT CHECK @ {now_pl}] ({len(unique_sets)} set(s))", *log_rows]
+            )
+            print(summary_block, flush=True)
+            try:
+                log_file = Path(self.db.db_path).parent / "scraper_runs.log"
+                log_file.parent.mkdir(parents=True, exist_ok=True)
+                with log_file.open("a", encoding="utf-8") as f:
+                    f.write(summary_block + "\n\n")
+            except Exception as exc:
+                logger.debug("Failed writing midnight check to scraper_runs.log: %s", exc)
+
+        return results, any_changed
 
     async def scan_single_set(self, set_number: str) -> list[Offer]:
         started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -825,6 +958,8 @@ class LegoMonitorService:
             f"<b>LEGO {html.escape(sub.set_number)} - {set_title}</b>",
             f"Official LEGO Catalog Price: <b>{msrp_str}</b>",
         ]
+        if best.availability_change_note:
+            lines.append(f"🚨 <b>{html.escape(best.availability_change_note)}</b>")
         if best.has_price_change and best.previous_price_pln is not None:
             diff = best.price_change_pln or 0.0
             pct = best.price_change_pct or 0.0

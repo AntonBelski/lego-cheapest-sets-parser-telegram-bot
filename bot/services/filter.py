@@ -311,14 +311,12 @@ def classify_condition(
 def is_valid_offer_url(url: str) -> bool:
     """
     Reject links to lego.com promo/general pages or generic marketplace homepages/search pages
-    that are not specific item/offer pages.
+    that are not specific item/offer pages. Allow direct lego.com/<locale>/product/<slug> URLs.
     """
     u = (url or "").strip().lower()
     if not u.startswith(("http://", "https://")):
         return False
     bad_fragments = (
-        "lego.com/",
-        "shop.lego.com/",
         "lego-offers-promotions",
         "/szukaj",
         "/search?",
@@ -329,4 +327,6 @@ def is_valid_offer_url(url: str) -> bool:
     )
     if any(b in u for b in bad_fragments):
         return False
+    if "lego.com/" in u or "shop.lego.com/" in u:
+        return bool(re.search(r"lego\.com/[a-z]{2}-[a-z]{2}/product/[^/?#]+", u))
     return True

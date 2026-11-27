@@ -1047,6 +1047,16 @@ async def test_run_daemon_multi_check_scheduler_and_summary(tmp_path: Path, monk
     assert exc_info.value.code == 1
     assert scan_call_count == 2
     assert any(j["id"] == "price_scan_job" and j["minutes"] == 15 for j in scheduled_jobs)
+    pre_job = next(j for j in scheduled_jobs if j["id"] == "lego_com_midnight_pre")
+    post_job = next(j for j in scheduled_jobs if j["id"] == "lego_com_midnight_post")
+    assert pre_job["trigger"] == "cron"
+    assert pre_job["hour"] == 23
+    assert pre_job["minute"] == "58,59"
+    assert str(pre_job["timezone"]) == "Europe/Warsaw"
+    assert post_job["trigger"] == "cron"
+    assert post_job["hour"] == 0
+    assert post_job["minute"] == "0-5"
+    assert str(post_job["timezone"]) == "Europe/Warsaw"
 
     out = capsys.readouterr().out
     assert "WORKFLOW SESSION SUMMARY (172m window, 15-min checks)" in out
@@ -1063,3 +1073,231 @@ async def test_run_daemon_multi_check_scheduler_and_summary(tmp_path: Path, monk
 
     log_text = (tmp_path / "scraper_runs.log").read_text(encoding="utf-8")
     assert "WORKFLOW SESSION SUMMARY" in log_text
+
+
+def test_lego_com_url_validation_and_html_parsing() -> None:
+    import json
+    from bot.scrapers.lego_com import LegoComScraper
+    from bot.services.filter import is_valid_offer_url
+
+    assert is_valid_offer_url("https://www.lego.com/pl-pl/product/great-deku-tree-2-in-1-77092") is True
+    assert is_valid_offer_url("https://www.lego.com/pl-pl/product/10316") is True
+    assert is_valid_offer_url("https://www.lego.com/pl-pl/") is False
+    assert is_valid_offer_url("https://www.lego.com/pl-pl/page/lego-offers-promotions") is False
+    assert is_valid_offer_url("https://www.lego.com/pl-pl/search?q=77092") is False
+
+    def _build_next_html(
+        set_num: str,
+        name: str,
+        slug: str,
+        avail_status: str,
+        avail_text: str,
+        can_add: bool,
+        price_pln: float,
+        list_price_pln: float,
+        on_sale: bool,
+    ) -> str:
+        apollo = {
+            f"SingleVariantProduct:{set_num}": {
+                "productCode": set_num,
+                "name": name,
+                "slug": slug,
+                "variant": {"__ref": f"ProductVariant:{set_num}"},
+            },
+            f"ProductVariant:{set_num}": {
+                "attributes": {"__ref": f"ProductAttributes:{set_num}"},
+                "price": {"__ref": f"Price:{set_num}"},
+                "listPrice": {"__ref": f"ListPrice:{set_num}"},
+            },
+            f"ProductAttributes:{set_num}": {
+                "availabilityStatus": avail_status,
+                "availabilityText": avail_text,
+                "canAddToBag": can_add,
+                "onSale": on_sale,
+            },
+            f"Price:{set_num}": {
+                "centAmount": int(round(price_pln * 100)),
+                "formattedValue": price_pln,
+                "currencyCode": "PLN",
+            },
+            f"ListPrice:{set_num}": {
+                "centAmount": int(round(list_price_pln * 100)),
+                "formattedValue": list_price_pln,
+                "currencyCode": "PLN",
+            },
+        }
+        next_json = json.dumps({"props": {"pageProps": {"__APOLLO_STATE__": apollo}}})
+        ld_json = json.dumps(
+            {
+                "@context": "https://schema.org/",
+                "@type": "Product",
+                "@id": f"https://www.lego.com/pl-pl/product/{slug}",
+                "productId": set_num,
+                "name": name,
+                "image": f"https://www.lego.com/cdn/cs/set/assets/test/{set_num}.png",
+            }
+        )
+        return (
+            f'<html><head><script type="application/ld+json">{ld_json}</script></head>'
+            f'<body><script id="__NEXT_DATA__" type="application/json">{next_json}</script></body></html>'
+        )
+
+    avail_html = _build_next_html(
+        "10316", "Rivendell", "the-lord-of-the-rings-rivendell-10316",
+        "E_AVAILABLE", "Dostępne teraz", True, 2149.99, 2149.99, False,
+    )
+    p1 = LegoComScraper.parse_product_html("10316", avail_html)
+    assert p1 is not None
+    assert p1.can_add_to_bag is True
+    assert p1.availability_status == "E_AVAILABLE"
+    assert p1.price_pln == 2149.99
+    assert p1.url == "https://www.lego.com/pl-pl/product/the-lord-of-the-rings-rivendell-10316"
+    assert p1.image_url == "https://www.lego.com/cdn/cs/set/assets/test/10316.png"
+
+    sale_html = _build_next_html(
+        "75192", "Millennium Falcon", "millennium-falcon-75192",
+        "E_AVAILABLE", "Dostępne teraz", True, 2519.99, 3599.99, True,
+    )
+    p2 = LegoComScraper.parse_product_html("75192", sale_html)
+    assert p2 is not None
+    assert p2.on_sale is True
+    assert p2.price_pln == 2519.99
+    assert p2.list_price_pln == 3599.99
+
+    retired_html = _build_next_html(
+        "77092", "Great Deku Tree", "great-deku-tree-2-in-1-77092",
+        "R_RETIRED", "Produkcja zakończona", False, 1299.99, 1299.99, False,
+    )
+    p3 = LegoComScraper.parse_product_html("77092", retired_html)
+    assert p3 is not None
+    assert p3.can_add_to_bag is False
+    assert p3.availability_status == "R_RETIRED"
+
+    # LD+JSON fallback when __NEXT_DATA__ is absent
+    ld_only_html = (
+        '<html><head><script type="application/ld+json">'
+        + json.dumps(
+            {
+                "@type": "Product",
+                "@id": "https://www.lego.com/pl-pl/product/great-deku-tree-2-in-1-77092",
+                "productId": "77092",
+                "name": "Great Deku Tree",
+                "offers": {
+                    "price": "1250.00",
+                    "priceCurrency": "PLN",
+                    "availability": "https://schema.org/InStock",
+                },
+            }
+        )
+        + "</script></head></html>"
+    )
+    p4 = LegoComScraper.parse_product_html("77092", ld_only_html)
+    assert p4 is not None
+    assert p4.can_add_to_bag is True
+    assert p4.price_pln == 1250.00
+
+
+@pytest.mark.asyncio
+async def test_lego_com_price_drops_and_retired_restock_notifications(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import json
+    import bot.scrapers.lego_com as lego_com_mod
+    import bot.services.monitor as monitor_mod
+
+    db = Database(tmp_path / "lego_com_notify.db")
+    await db.init()
+
+    await db.upsert_subscription(
+        chat_id=999,
+        set_number="77092",
+        price_from=1000.0,
+        price_to=1500.0,
+        set_name="Great Deku Tree",
+        msrp_pln=1299.99,
+    )
+
+    sent_messages: list[str] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id: int, text: str, **kwargs):
+            sent_messages.append(text)
+
+        async def send_photo(self, chat_id: int, caption: str, **kwargs):
+            sent_messages.append(caption)
+
+    async def fake_fetch_img(*args, **kwargs):
+        return None
+
+    async def fake_refresh_currency():
+        return None
+
+    monkeypatch.setattr(monitor_mod, "fetch_set_image_bytes", fake_fetch_img)
+    monkeypatch.setattr(monitor_mod.currency_converter, "refresh_if_needed", fake_refresh_currency)
+
+    def _html(avail_status: str, can_add: bool, price: float, list_price: float, on_sale: bool = False) -> str:
+        apollo = {
+            "SingleVariantProduct:77092": {
+                "productCode": "77092",
+                "name": "Great Deku Tree 2 w 1",
+                "slug": "great-deku-tree-2-in-1-77092",
+                "variant": {"__ref": "ProductVariant:77092"},
+            },
+            "ProductVariant:77092": {
+                "attributes": {"__ref": "ProductAttributes:77092"},
+                "price": {"__ref": "Price:77092"},
+                "listPrice": {"__ref": "ListPrice:77092"},
+            },
+            "ProductAttributes:77092": {
+                "availabilityStatus": avail_status,
+                "availabilityText": "Dostępne teraz" if can_add else "Produkcja zakończona",
+                "canAddToBag": can_add,
+                "onSale": on_sale,
+            },
+            "Price:77092": {"centAmount": int(round(price * 100)), "formattedValue": price, "currencyCode": "PLN"},
+            "ListPrice:77092": {"centAmount": int(round(list_price * 100)), "formattedValue": list_price, "currencyCode": "PLN"},
+        }
+        return f'<script id="__NEXT_DATA__">{json.dumps({"props": {"pageProps": {"__APOLLO_STATE__": apollo}}})}</script>'
+
+    state_holder = {"html": _html("E_AVAILABLE", True, 1700.0, 1700.0)}
+
+    async def fake_get_text(url: str, **kwargs):
+        assert kwargs.get("use_cache") is False
+        return 200, state_holder["html"], {}
+
+    monkeypatch.setattr(lego_com_mod.http_client, "get_text", fake_get_text)
+
+    monitor = LegoMonitorService(db=db, bot=FakeBot())  # type: ignore
+
+    # A: 1700 PLN (outside 1000..1500 range) -> recorded in DB, NOT notified
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 0
+
+    # B: Drops from 1700 -> 1300 (now inside 1000..1500) -> NOTIFY with 1700 -> 1300 price change!
+    state_holder["html"] = _html("E_AVAILABLE", True, 1300.0, 1700.0, on_sale=True)
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 1
+    assert "<s>1700.00 PLN</s> ➔ <b>1300.00 PLN</b>" in sent_messages[-1]
+    assert "-400.00 PLN" in sent_messages[-1]
+
+    # C: Drops further from 1300 -> 1200 -> NOTIFY AGAIN with 1300 -> 1200!
+    state_holder["html"] = _html("E_AVAILABLE", True, 1200.0, 1700.0, on_sale=True)
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 2
+    assert "<s>1300.00 PLN</s> ➔ <b>1200.00 PLN</b>" in sent_messages[-1]
+    assert "-100.00 PLN" in sent_messages[-1]
+
+    # D: Goes R_RETIRED (not buyable), then reappears at 1250 PLN (even higher than 1200!) -> MUST NOTIFY AGAIN!
+    state_holder["html"] = _html("R_RETIRED", False, 1250.0, 1250.0, on_sale=False)
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 2
+
+    state_holder["html"] = _html("E_AVAILABLE", True, 1250.0, 1250.0, on_sale=False)
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 3
+    assert "Back in stock on LEGO.com! (was: Retired)" in sent_messages[-1]
+    assert "1250.00 PLN" in sent_messages[-1]
+
+    # E: Repeated check at same 1250 PLN while still available -> no duplicate spam
+    await monitor.scan_lego_com_only()
+    assert len(sent_messages) == 3

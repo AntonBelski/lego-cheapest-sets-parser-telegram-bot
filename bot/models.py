@@ -70,6 +70,7 @@ def sanitize_url_for_telegram(url: str) -> str:
 
 
 SOURCE_DISPLAY_LABELS: dict[str, str] = {
+    "lego.com": "LEGO.com",
     "promoklocki.pl": "Promoklocki",
     "olx.pl": "OLX",
     "vinted.pl": "Vinted",
@@ -107,6 +108,7 @@ def format_short_store_label(source: Optional[str], store_name: Optional[str]) -
     """
     src = (source or "").strip().lower()
     if src in (
+        "lego.com",
         "bricklink.com",
         "ebay.pl",
         "vinted.pl",
@@ -244,6 +246,7 @@ class Offer:
     previous_delivery_price_pln: Optional[float] = None
     previous_delivery_known: Optional[bool] = None
     was_previously_notified: bool = False
+    availability_change_note: Optional[str] = None
     found_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def __post_init__(self) -> None:

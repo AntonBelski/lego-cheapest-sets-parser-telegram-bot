@@ -232,6 +232,20 @@ class Database:
                 """
             )
 
+            # 8. LEGO.com availability transitions (for retired -> available restock alerts)
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS lego_com_availability (
+                    set_number TEXT PRIMARY KEY,
+                    availability_status TEXT NOT NULL,
+                    availability_text TEXT NULL,
+                    can_add_to_bag INTEGER NOT NULL DEFAULT 0,
+                    last_price_pln REAL NULL,
+                    updated_at TEXT NOT NULL
+                );
+                """
+            )
+
             await db.execute(
                 """
                 DELETE FROM price_observations
@@ -897,6 +911,61 @@ class Database:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
+
+    async def record_lego_com_availability(
+        self,
+        set_number: str,
+        availability_status: str,
+        availability_text: Optional[str],
+        can_add_to_bag: bool,
+        last_price_pln: Optional[float],
+    ) -> Optional[dict]:
+        """
+        Persist the latest LEGO.com availability snapshot for `set_number` and return
+        the previous snapshot dict (if any).
+        When the set is NOT buyable (`not can_add_to_bag`, e.g. R_RETIRED or H_OUT_OF_STOCK),
+        clear any prior `lego.com` entries in `notified_offers` so that if the set later
+        reappears in stock—even at the exact same price—the user is notified again.
+        """
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM lego_com_availability WHERE set_number = ?",
+                (str(set_number).strip(),),
+            ) as cursor:
+                prev_row = await cursor.fetchone()
+                prev = dict(prev_row) if prev_row else None
+
+            await db.execute(
+                """
+                INSERT INTO lego_com_availability (
+                    set_number, availability_status, availability_text,
+                    can_add_to_bag, last_price_pln, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(set_number) DO UPDATE SET
+                    availability_status = excluded.availability_status,
+                    availability_text = excluded.availability_text,
+                    can_add_to_bag = excluded.can_add_to_bag,
+                    last_price_pln = excluded.last_price_pln,
+                    updated_at = excluded.updated_at;
+                """,
+                (
+                    str(set_number).strip(),
+                    availability_status,
+                    availability_text,
+                    1 if can_add_to_bag else 0,
+                    last_price_pln,
+                    now_iso,
+                ),
+            )
+            if not can_add_to_bag:
+                await db.execute(
+                    "DELETE FROM notified_offers WHERE set_number = ? AND source = 'lego.com';",
+                    (str(set_number).strip(),),
+                )
+            await db.commit()
+            return prev
 
     async def record_scan_run_logs(
         self,
